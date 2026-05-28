@@ -153,7 +153,7 @@ def run_translation(pdf_bytes, glossary, font_path, api_key,
                 st.error(f"翻译中断！大模型报错: {exc}") # 在网页上弹出红字
                 translated = blk["text"]
         results.append({**blk, "translated": translated})
-            done += 1
+                done += 1
             on_progress(done / total_blocks)
 
         for r in results:
