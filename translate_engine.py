@@ -149,11 +149,12 @@ def run_translation(pdf_bytes, glossary, font_path, api_key,
                     if t.strip():
                         unrecorded.add(t.strip())
             except Exception as exc:
-                print(f"翻译接口报错: {exc}") # 在后台打印
-                st.error(f"翻译中断！大模型报错: {exc}") # 在网页上弹出红字
+                print(f"翻译接口报错: {exc}")
+                st.error(f"⚠️ 翻译调用失败！API 报错信息：{exc}")
                 translated = blk["text"]
-        results.append({**blk, "translated": translated})
-                done += 1
+            
+            results.append({**blk, "translated": translated})
+            done += 1
             on_progress(done / total_blocks)
 
         for r in results:
