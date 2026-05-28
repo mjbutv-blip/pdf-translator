@@ -81,7 +81,7 @@ def _translate_block(client, text: str, glossary: dict) -> dict:
         '格式：{"translated_text": "中文结果", "unrecorded_terms": ["term1"]}'
     )
     msg = client.messages.create(
-        model="claude-3-5-sonnet-20241022", # 帮你修正了模型名称，"claude-sonnet-4-6" 并不是正式的API模型名
+        model="claude-sonnet-4-6",
         max_tokens=2048,
         messages=[{"role": "user", "content": prompt}],
     )
