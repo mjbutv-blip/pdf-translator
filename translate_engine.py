@@ -148,7 +148,7 @@ def run_translation(pdf_bytes, glossary, font_path, api_key,
                 for t in res.get("unrecorded_terms", []):
                     if t.strip():
                         unrecorded.add(t.strip())
-        except Exception as exc:
+            except Exception as exc:
                 print(f"翻译接口报错: {exc}") # 在后台打印
                 st.error(f"翻译中断！大模型报错: {exc}") # 在网页上弹出红字
                 translated = blk["text"]
