@@ -83,6 +83,16 @@ def _translate_block(client, text: str, glossary: dict) -> dict:
     msg = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=2048,
+        system=(
+            "你是专业服装行业翻译。处理的文本通常是工艺单表格中的一整行，"
+            "可能将英文描述与多个数字混排（例如：front underbust width 30 31 33）。"
+            "【最高优先级规则】将所有英文词汇翻译成中文，"
+            "但绝对不能丢弃文本中的任何数字、标点和尺码！"
+            "必须将原有数字原封不动地保留在翻译结果中，"
+            "并尽量维持原有的空格与排列顺序。"
+            "例如输入 front width  30  31，必须输出 前胸宽  30  31。"
+            "绝对禁止在遇到数字时拒绝翻译或仅返回英文原文。"
+        ),
         messages=[{"role": "user", "content": prompt}],
     )
     raw = msg.content[0].text.strip()
@@ -141,6 +151,20 @@ def run_translation(pdf_bytes, glossary, font_path, api_key,
 
         results = []
         for blk in blocks:
+            _t        = blk["text"].strip()
+            alpha     = len(re.findall(r'[a-zA-Z]', _t))
+            has_digit = bool(re.search(r'\d', _t))
+
+            # 纯数字/符号块，无英文，直接保留原样
+            if alpha == 0:
+                done += 1; on_progress(done / total_blocks); continue
+            # 极短文本（≤4字符）：单字母尺码标签等
+            if len(_t) <= 4:
+                done += 1; on_progress(done / total_blocks); continue
+            # 含数字但英文字母极少（≤2个）：70A、32B 等尺码代号
+            if has_digit and alpha <= 2:
+                done += 1; on_progress(done / total_blocks); continue
+
             on_block(blk["text"][:60].replace("\n", " "))
             try:
                 res        = _translate_block(client, blk["text"], glossary)
