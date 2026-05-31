@@ -119,71 +119,70 @@ def run_translation(pdf_bytes, glossary, font_path, api_key,
     total_pages = len(doc)
     unrecorded  = set()
 
-    page_blocks: list[list[dict]] = []
+    # 预扫描：以 span 为最小单元收集，bbox 精确到单词级别
+    page_spans: list[list[dict]] = []
     for pn in range(total_pages):
-        tb = []
+        ts = []
         for blk in doc[pn].get_text("dict")["blocks"]:
             if blk["type"] != 0:
                 continue
-            parts, sizes = [], []
             for ln in blk.get("lines", []):
                 for sp in ln.get("spans", []):
-                    if sp["text"].strip():
-                        parts.append(sp["text"])
-                        sizes.append(sp["size"])
-                parts.append("\n")
-            text = "".join(parts).strip()
-            if not text:
-                continue
-            tb.append({
-                "bbox": blk["bbox"],
-                "text": text,
-                "size": sum(sizes) / len(sizes) if sizes else 10.0,
-            })
-        page_blocks.append(tb)
+                    text = sp["text"].strip()
+                    if not text:
+                        continue
+                    ts.append({
+                        "bbox": sp["bbox"],
+                        "text": sp["text"],
+                        "size": sp["size"],
+                    })
+        page_spans.append(ts)
 
-    total_blocks = max(sum(len(b) for b in page_blocks), 1)
+    total_spans = max(sum(len(s) for s in page_spans), 1)
     done = 0
 
-    for pn, blocks in enumerate(page_blocks):
+    for pn, spans in enumerate(page_spans):
         page = doc[pn]
-        on_page(pn, total_pages, len(blocks))
+        on_page(pn, total_pages, len(spans))
 
         results = []
-        for blk in blocks:
-            _t        = blk["text"].strip()
+        for sp in spans:
+            _t        = sp["text"].strip()
             alpha     = len(re.findall(r'[a-zA-Z]', _t))
             has_digit = bool(re.search(r'\d', _t))
 
-            # 纯数字/符号块，无英文，直接保留原样
+            # 纯数字/符号，无英文字母——保留原样，绝不擦除
             if alpha == 0:
-                done += 1; on_progress(done / total_blocks); continue
-            # 极短文本（≤4字符）：单字母尺码标签等
+                done += 1; on_progress(done / total_spans); continue
+            # 极短文本（≤4字符）：单字母尺码标签、连字符等
             if len(_t) <= 4:
-                done += 1; on_progress(done / total_blocks); continue
+                done += 1; on_progress(done / total_spans); continue
             # 含数字但英文字母极少（≤2个）：70A、32B 等尺码代号
             if has_digit and alpha <= 2:
-                done += 1; on_progress(done / total_blocks); continue
+                done += 1; on_progress(done / total_spans); continue
 
-            on_block(blk["text"][:60].replace("\n", " "))
+            on_block(_t[:60])
             try:
-                res        = _translate_block(client, blk["text"], glossary)
-                translated = res.get("translated_text", blk["text"])
+                res        = _translate_block(client, sp["text"], glossary)
+                translated = res.get("translated_text", sp["text"])
                 for t in res.get("unrecorded_terms", []):
                     if t.strip():
                         unrecorded.add(t.strip())
             except Exception as exc:
                 print(f"翻译接口报错: {exc}")
-                st.error(f"⚠️ 翻译调用失败！API 报错信息：{exc}")
-                translated = blk["text"]
-            
-            results.append({**blk, "translated": translated})
-            done += 1
-            on_progress(done / total_blocks)
+                st.error(f"⚠️ 翻译调用失败：{exc}")
+                translated = sp["text"]
 
+            results.append({**sp, "translated": translated})
+            done += 1
+            on_progress(done / total_spans)
+
+        # 批量擦除（span 级精确 bbox，不越界）
         for r in results:
             page.add_redact_annot(fitz.Rect(r["bbox"]), fill=(1, 1, 1))
         page.apply_redactions()
+
+        # 在原 span bbox 内写入中文
         for r in results:
             _insert_text(page, r["bbox"], r["translated"], r["size"], font_path)
 
