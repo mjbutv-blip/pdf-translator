@@ -3,5 +3,6 @@ pymupdf
 pandas
 anthropic
 openpyxl
+Pillow
 gspread
 google-auth
