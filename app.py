@@ -1539,18 +1539,37 @@ with tab_pdf:
 # ════════════════════════════════════════════════════════════════════════════
 #  Excel Tab
 # ════════════════════════════════════════════════════════════════════════════
+def _build_excel_report_bytes(report_rows: list[dict]) -> bytes:
+    report_wb = openpyxl.Workbook()
+    report_ws = report_wb.active
+    report_ws.title = "翻译报告"
+    headers = ["sheet_name", "cell_coordinate", "original_text", "translated_text",
+               "status", "skip_reason", "is_merged_cell", "layout_warning"]
+    report_ws.append(headers)
+    for cell in report_ws[1]:
+        cell.font = openpyxl.styles.Font(bold=True)
+    for r in report_rows:
+        report_ws.append([r[h] for h in headers])
+    for col_letter, width in zip("ABCDEFGH", [12, 14, 35, 35, 8, 20, 14, 14]):
+        report_ws.column_dimensions[col_letter].width = width
+    buf = io.BytesIO()
+    report_wb.save(buf)
+    return buf.getvalue()
+
+
 with tab_excel:
-    excel_file = st.file_uploader(
-        "上传待翻译 Excel (.xlsx)",
+    excel_files = st.file_uploader(
+        "上传待翻译 Excel（可一次选择多个文件）",
         type=["xlsx"],
+        accept_multiple_files=True,
         key="excel_uploader",
     )
     st.caption(f"📚 当前术语库：**{st.session_state['glossary_source']}** · {len(glossary_df_to_dict(st.session_state['glossary_df']))} 条术语（可在「术语库管理」标签页编辑）")
 
-    can_start_excel = bool(excel_file and api_key)
+    can_start_excel = bool(excel_files and api_key)
     if not can_start_excel:
         missing = []
-        if not excel_file:
+        if not excel_files:
             missing.append("Excel 文件")
         if not api_key:
             missing.append("Anthropic API Key")
@@ -1568,89 +1587,105 @@ with tab_excel:
                "且坐标是视觉模型估算的，容易跟实际版式错位。图片本身会原样保留。")
 
     if start_excel_btn:
-        for key in ("excel_result", "excel_report", "n_cells", "n_images", "source_name"):
-            st.session_state.pop(key, None)
+        st.session_state["excel_batch_results"] = []
 
-        progress_bar = st.progress(0.0, text="初始化…")
-        with st.status("翻译进行中，请稍候…", expanded=True) as status:
-            cell_ph = st.empty()
+        glossary_bytes = glossary_df_to_xlsx_bytes(st.session_state["glossary_df"])
+        overall = st.progress(0.0, text=f"准备处理 {len(excel_files)} 个文件…")
+        results = []
 
-            def on_cell(preview):
-                cell_ph.caption(f"▶ 正在翻译：{preview}…")
+        for fi, ef in enumerate(excel_files):
+            with st.status(f"正在处理：{ef.name}", expanded=True) as status:
+                cell_ph = st.empty()
+                file_prog = st.progress(0.0)
 
-            def on_progress(frac):
-                progress_bar.progress(frac, text=f"翻译进度 {frac:.0%}")
+                def on_cell(preview):
+                    cell_ph.caption(f"▶ 正在翻译：{preview}…")
 
-            try:
-                glossary_bytes = glossary_df_to_xlsx_bytes(st.session_state["glossary_df"])
-                excel_out, n_cells, n_images, report_rows = run_excel_translation(
-                    xlsx_bytes=excel_file.read(),
-                    glossary_bytes=glossary_bytes,
-                    api_key=api_key,
-                    on_cell=on_cell,
-                    on_progress=on_progress,
-                    translate_images=False,
-                )
-                cell_ph.empty()
-                status.update(label="✅ 翻译完成！", state="complete")
-                progress_bar.progress(1.0, text="完成 ✓")
-                st.session_state["excel_result"] = excel_out
-                st.session_state["excel_report"] = report_rows
-                st.session_state["n_cells"]      = n_cells
-                st.session_state["n_images"]     = n_images
-                st.session_state["source_name"]  = excel_file.name
+                def on_progress(frac):
+                    file_prog.progress(frac, text=f"翻译进度 {frac:.0%}")
 
-            except Exception as e:
-                cell_ph.empty()
-                status.update(label=f"❌ 出错：{e}", state="error")
-                st.error(str(e))
+                try:
+                    excel_out, n_cells, n_images, report_rows = run_excel_translation(
+                        xlsx_bytes=ef.read(),
+                        glossary_bytes=glossary_bytes,
+                        api_key=api_key,
+                        on_cell=on_cell,
+                        on_progress=on_progress,
+                        translate_images=False,
+                    )
+                    cell_ph.empty()
+                    status.update(label=f"✅ {ef.name} 翻译完成", state="complete")
+                    results.append({
+                        "name": ef.name,
+                        "ok": True,
+                        "excel": excel_out,
+                        "report": report_rows,
+                        "n_cells": n_cells,
+                    })
+                except Exception as e:
+                    cell_ph.empty()
+                    status.update(label=f"❌ {ef.name} 出错：{e}", state="error")
+                    results.append({"name": ef.name, "ok": False, "error": str(e)})
 
-    if st.session_state.get("excel_result"):
+            overall.progress((fi + 1) / len(excel_files), text=f"已完成 {fi + 1}/{len(excel_files)}")
+
+        st.session_state["excel_batch_results"] = results
+
+    batch_results = st.session_state.get("excel_batch_results", [])
+    if batch_results:
         st.divider()
-        n_c = st.session_state["n_cells"]
-        report_rows = st.session_state.get("excel_report", [])
-        n_warn = sum(1 for r in report_rows if r["layout_warning"])
-        n_merged = sum(1 for r in report_rows if r["is_merged_cell"])
-        st.success(
-            f"翻译完成！文字单元格 **{n_c}** 个"
-            f"（合并单元格内 **{n_merged}** 个，触发换行提醒 **{n_warn}** 个）。"
-            "图片未处理，原样保留。"
-        )
+        n_ok = sum(1 for r in batch_results if r["ok"])
+        st.success(f"批量处理完成：成功 **{n_ok}** / 失败 **{len(batch_results) - n_ok}**（共 {len(batch_results)} 个文件）。图片未处理，原样保留。")
 
-        src_name = st.session_state.get("source_name", "translated.xlsx")
-        out_name = src_name.replace(".xlsx", "_中文版.xlsx")
-        col1, col2 = st.columns(2)
-        with col1:
+        ok_results = [r for r in batch_results if r["ok"]]
+        if len(ok_results) > 1:
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w") as zf:
+                for r in ok_results:
+                    base = r["name"].rsplit(".", 1)[0]
+                    zf.writestr(f"{base}_中文版.xlsx", r["excel"])
+                    zf.writestr(f"{base}_翻译报告.xlsx", _build_excel_report_bytes(r["report"]))
             st.download_button(
-                label="⬇️  下载中文 Excel",
-                data=st.session_state["excel_result"],
-                file_name=out_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                label=f"⬇️  打包下载全部 {len(ok_results)} 个译文（ZIP）",
+                data=zip_buf.getvalue(),
+                file_name="translated_excels.zip",
+                mime="application/zip",
                 use_container_width=True,
                 type="primary",
             )
-        with col2:
-            report_wb = openpyxl.Workbook()
-            report_ws = report_wb.active
-            report_ws.title = "翻译报告"
-            headers = ["sheet_name", "cell_coordinate", "original_text", "translated_text",
-                       "status", "skip_reason", "is_merged_cell", "layout_warning"]
-            report_ws.append(headers)
-            for cell in report_ws[1]:
-                cell.font = openpyxl.styles.Font(bold=True)
-            for r in report_rows:
-                report_ws.append([r[h] for h in headers])
-            for col_letter, width in zip("ABCDEFGH", [12, 14, 35, 35, 8, 20, 14, 14]):
-                report_ws.column_dimensions[col_letter].width = width
-            report_buf = io.BytesIO()
-            report_wb.save(report_buf)
-            st.download_button(
-                label="⬇️  下载翻译报告",
-                data=report_buf.getvalue(),
-                file_name=src_name.replace(".xlsx", "_翻译报告.xlsx"),
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+
+        for i, r in enumerate(batch_results):
+            with st.expander(f"{'✅' if r['ok'] else '❌'} {r['name']}", expanded=not r["ok"]):
+                if r["ok"]:
+                    base = r["name"].rsplit(".", 1)[0]
+                    report_rows = r["report"]
+                    n_warn = sum(1 for row in report_rows if row["layout_warning"])
+                    n_merged = sum(1 for row in report_rows if row["is_merged_cell"])
+                    st.caption(
+                        f"文字单元格 **{r['n_cells']}** 个"
+                        f"（合并单元格内 **{n_merged}** 个，触发换行提醒 **{n_warn}** 个）"
+                    )
+                    dl1, dl2 = st.columns(2)
+                    with dl1:
+                        st.download_button(
+                            label="⬇️  下载中文 Excel",
+                            data=r["excel"],
+                            file_name=f"{base}_中文版.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            key=f"excel_dl_{i}",
+                        )
+                    with dl2:
+                        st.download_button(
+                            label="⬇️  下载翻译报告",
+                            data=_build_excel_report_bytes(report_rows),
+                            file_name=f"{base}_翻译报告.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            key=f"report_dl_{i}",
+                        )
+                else:
+                    st.error(r["error"])
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Glossary Management Tab
