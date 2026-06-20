@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+
+# Editor backups
+*.bak
+
+# Local test artifacts / sample client data — not part of the app
+run*.log
+test_*.xlsx
+test_*.pdf
+test_*.png
+sample*.pdf
+sample*.xlsx
+sample*.png
+real_sample*.xlsx
+resaved_only.xlsx
+wraptest*.png
+wrapcheck*.png
+fix_verify.png
+图片可编辑文本框_*.xlsx
+S26890M101_*.xlsx
+unrecorded_terms.xlsx
+PASSION*.pdf
+.~*.xlsx
+.~*.xls
+.claude/
