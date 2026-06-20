@@ -1539,7 +1539,7 @@ with tab_pdf:
 # ════════════════════════════════════════════════════════════════════════════
 #  Excel Tab
 # ════════════════════════════════════════════════════════════════════════════
-def _build_excel_report_bytes(report_rows: list[dict]) -> bytes:
+def _build_excel_report_bytes(report_rows: list[dict], img_report_rows: list[dict] | None = None) -> bytes:
     report_wb = openpyxl.Workbook()
     report_ws = report_wb.active
     report_ws.title = "翻译报告"
@@ -1552,6 +1552,18 @@ def _build_excel_report_bytes(report_rows: list[dict]) -> bytes:
         report_ws.append([r[h] for h in headers])
     for col_letter, width in zip("ABCDEFGH", [12, 14, 35, 35, 8, 20, 14, 14]):
         report_ws.column_dimensions[col_letter].width = width
+
+    if img_report_rows:
+        img_ws = report_wb.create_sheet("图片译文")
+        img_headers = ["drawing", "image", "status", "original_text", "translated_text", "skip_reason"]
+        img_ws.append(img_headers)
+        for cell in img_ws[1]:
+            cell.font = openpyxl.styles.Font(bold=True)
+        for r in img_report_rows:
+            img_ws.append([r.get(h, "") for h in img_headers])
+        for col_letter, width in zip("ABCDEF", [25, 18, 10, 35, 35, 20]):
+            img_ws.column_dimensions[col_letter].width = width
+
     buf = io.BytesIO()
     report_wb.save(buf)
     return buf.getvalue()
@@ -1575,6 +1587,14 @@ with tab_excel:
             missing.append("Anthropic API Key")
         st.info(f"请先提供：{'、'.join(missing)}")
 
+    translate_images_checked = st.checkbox(
+        "🧪 同时翻译图片内文字（实验性：生成可编辑 TextBox，不改图片像素）",
+        key="excel_translate_images_checkbox",
+    )
+    st.caption("勾选后，图片里识别到的英文标注会生成黄底中文 TextBox 叠在图片对应位置，"
+               "可在 Excel/WPS 里直接双击编辑、拖动。坐标是视觉模型估算的，密集排版的图"
+               "可能不够精确，请翻译后打开核对。不勾选则图片完全原样保留。")
+
     start_excel_btn = st.button(
         "🚀  开始翻译 Excel",
         disabled=not can_start_excel,
@@ -1583,13 +1603,11 @@ with tab_excel:
         key="start_excel_btn",
     )
 
-    st.caption("ℹ️ 图片内文字翻译目前默认关闭：会把中文烧录进图片像素（不可编辑），"
-               "且坐标是视觉模型估算的，容易跟实际版式错位。图片本身会原样保留。")
-
     if start_excel_btn:
         st.session_state["excel_batch_results"] = []
 
         glossary_bytes = glossary_df_to_xlsx_bytes(st.session_state["glossary_df"])
+        glossary_dict = load_glossary(glossary_bytes)
         overall = st.progress(0.0, text=f"准备处理 {len(excel_files)} 个文件…")
         results = []
 
@@ -1613,6 +1631,20 @@ with tab_excel:
                         on_progress=on_progress,
                         translate_images=False,
                     )
+
+                    img_report_rows = []
+                    if translate_images_checked:
+                        img_ph = st.empty()
+
+                        def on_image(i, total, fname):
+                            img_ph.caption(f"🖼️ 图片译文 {i}/{total}：{fname}")
+
+                        client = anthropic.Anthropic(api_key=api_key)
+                        excel_out, img_report_rows = add_translated_textboxes_to_excel(
+                            excel_out, client, glossary_dict, on_image,
+                        )
+                        img_ph.empty()
+
                     cell_ph.empty()
                     status.update(label=f"✅ {ef.name} 翻译完成", state="complete")
                     results.append({
@@ -1620,6 +1652,7 @@ with tab_excel:
                         "ok": True,
                         "excel": excel_out,
                         "report": report_rows,
+                        "img_report": img_report_rows,
                         "n_cells": n_cells,
                     })
                 except Exception as e:
@@ -1635,7 +1668,8 @@ with tab_excel:
     if batch_results:
         st.divider()
         n_ok = sum(1 for r in batch_results if r["ok"])
-        st.success(f"批量处理完成：成功 **{n_ok}** / 失败 **{len(batch_results) - n_ok}**（共 {len(batch_results)} 个文件）。图片未处理，原样保留。")
+        img_note = "图片已按勾选生成可编辑 TextBox 译文。" if translate_images_checked else "图片未处理，原样保留。"
+        st.success(f"批量处理完成：成功 **{n_ok}** / 失败 **{len(batch_results) - n_ok}**（共 {len(batch_results)} 个文件）。{img_note}")
 
         ok_results = [r for r in batch_results if r["ok"]]
         if len(ok_results) > 1:
@@ -1644,7 +1678,8 @@ with tab_excel:
                 for r in ok_results:
                     base = r["name"].rsplit(".", 1)[0]
                     zf.writestr(f"{base}_中文版.xlsx", r["excel"])
-                    zf.writestr(f"{base}_翻译报告.xlsx", _build_excel_report_bytes(r["report"]))
+                    zf.writestr(f"{base}_翻译报告.xlsx",
+                                _build_excel_report_bytes(r["report"], r.get("img_report")))
             st.download_button(
                 label=f"⬇️  打包下载全部 {len(ok_results)} 个译文（ZIP）",
                 data=zip_buf.getvalue(),
@@ -1659,12 +1694,20 @@ with tab_excel:
                 if r["ok"]:
                     base = r["name"].rsplit(".", 1)[0]
                     report_rows = r["report"]
+                    img_report_rows = r.get("img_report") or []
                     n_warn = sum(1 for row in report_rows if row["layout_warning"])
                     n_merged = sum(1 for row in report_rows if row["is_merged_cell"])
                     st.caption(
                         f"文字单元格 **{r['n_cells']}** 个"
                         f"（合并单元格内 **{n_merged}** 个，触发换行提醒 **{n_warn}** 个）"
                     )
+                    if img_report_rows:
+                        n_img_ok = sum(1 for row in img_report_rows if row["status"] == "ok")
+                        n_img_skip = sum(1 for row in img_report_rows if row["status"] == "skipped")
+                        st.caption(
+                            f"图片译文 TextBox **{n_img_ok}** 条"
+                            + (f"，跳过 **{n_img_skip}** 处（详见报告）" if n_img_skip else "")
+                        )
                     dl1, dl2 = st.columns(2)
                     with dl1:
                         st.download_button(
@@ -1678,7 +1721,7 @@ with tab_excel:
                     with dl2:
                         st.download_button(
                             label="⬇️  下载翻译报告",
-                            data=_build_excel_report_bytes(report_rows),
+                            data=_build_excel_report_bytes(report_rows, img_report_rows),
                             file_name=f"{base}_翻译报告.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True,
