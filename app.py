@@ -3,9 +3,11 @@ import io
 import json
 import os
 import re
+import sqlite3
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
+from datetime import datetime
 
 import anthropic
 import fitz
@@ -17,6 +19,698 @@ from PIL import Image, ImageDraw, ImageFont
 
 DEFAULT_FONT     = Path(__file__).parent / "font.ttf"
 DEFAULT_GLOSSARY = Path(__file__).parent / "glossary.xlsx"
+DB_PATH          = Path(__file__).parent / "pdf_project.db"
+
+
+# ── Local user/customer/glossary access control ────────────────────────────────
+
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def hash_password(password: str) -> str:
+    # Basic local-only password hashing for the first SQLite version.
+    import hashlib
+    return hashlib.sha256(f"pdf-project::{password}".encode("utf-8")).hexdigest()
+
+
+def get_db_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with get_db_connection() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('company_admin', 'group_leader', 'staff')),
+                group_name TEXT,
+                assigned_customer_ids TEXT NOT NULL DEFAULT '[]'
+            );
+
+            CREATE TABLE IF NOT EXISTS customers (
+                customer_id TEXT PRIMARY KEY,
+                customer_name TEXT NOT NULL,
+                customer_code TEXT NOT NULL UNIQUE,
+                group_name TEXT NOT NULL,
+                assigned_staff_username TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS glossary_terms (
+                glossary_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                customer_id TEXT NOT NULL,
+                english_term TEXT NOT NULL,
+                chinese_translation TEXT NOT NULL,
+                note TEXT DEFAULT '',
+                created_by TEXT,
+                updated_by TEXT,
+                updated_at TEXT,
+                status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'inactive')),
+                FOREIGN KEY(customer_id) REFERENCES customers(customer_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS glossary_change_requests (
+                request_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                customer_id TEXT NOT NULL,
+                action_type TEXT NOT NULL CHECK(action_type IN ('add', 'update', 'delete')),
+                english_term_old TEXT,
+                chinese_translation_old TEXT,
+                english_term_new TEXT,
+                chinese_translation_new TEXT,
+                note TEXT DEFAULT '',
+                submitted_by TEXT NOT NULL,
+                submitted_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'approved', 'rejected')),
+                reviewed_by TEXT,
+                reviewed_at TEXT,
+                review_comment TEXT,
+                FOREIGN KEY(customer_id) REFERENCES customers(customer_id)
+            );
+            """
+        )
+
+
+def seed_demo_data_if_empty() -> None:
+    with get_db_connection() as conn:
+        exists = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
+        if exists:
+            return
+
+        users = [
+            ("u_admin", "admin", "admin123", "company_admin", "", []),
+            ("u_leader_a", "leader_a", "leader123", "group_leader", "A组", []),
+            ("u_staff_1", "staff_1", "staff123", "staff", "A组", ["CUST001"]),
+            ("u_staff_2", "staff_2", "staff123", "staff", "A组", ["CUST002"]),
+            ("u_staff_3", "staff_3", "staff123", "staff", "B组", ["CUST003"]),
+        ]
+        conn.executemany(
+            """
+            INSERT INTO users
+                (user_id, username, password_hash, role, group_name, assigned_customer_ids)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (uid, username, hash_password(password), role, group, json.dumps(assigned, ensure_ascii=False))
+                for uid, username, password, role, group, assigned in users
+            ],
+        )
+
+        customers = [
+            ("CUST001", "客户A", "CUST001", "A组", "staff_1"),
+            ("CUST002", "客户B", "CUST002", "A组", "staff_2"),
+            ("CUST003", "客户C", "CUST003", "B组", "staff_3"),
+        ]
+        conn.executemany(
+            """
+            INSERT INTO customers
+                (customer_id, customer_name, customer_code, group_name, assigned_staff_username)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            customers,
+        )
+
+        terms = [
+            ("CUST001", "gusset", "裆布", "客户A偏好：裆布", "admin"),
+            ("CUST001", "underwire", "钢圈", "", "admin"),
+            ("CUST001", "strap", "肩带", "", "admin"),
+            ("CUST002", "gusset", "裆衬", "客户B偏好：裆衬", "admin"),
+            ("CUST002", "underwire", "托圈", "", "admin"),
+            ("CUST002", "strap", "带仔", "", "admin"),
+            ("CUST003", "gusset", "裆里", "客户C偏好：裆里", "admin"),
+            ("CUST003", "underwire", "钢托", "", "admin"),
+            ("CUST003", "strap", "肩袢", "", "admin"),
+        ]
+        conn.executemany(
+            """
+            INSERT INTO glossary_terms
+                (customer_id, english_term, chinese_translation, note, created_by, updated_by, updated_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
+            """,
+            [(cid, en, zh, note, by, by, _now_iso()) for cid, en, zh, note, by in terms],
+        )
+
+
+def _user_from_row(row: sqlite3.Row | None) -> dict | None:
+    if row is None:
+        return None
+    user = dict(row)
+    try:
+        user["assigned_customer_ids"] = json.loads(user.get("assigned_customer_ids") or "[]")
+    except json.JSONDecodeError:
+        user["assigned_customer_ids"] = []
+    return user
+
+
+def authenticate_user(username: str, password: str) -> dict | None:
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE username = ? AND password_hash = ?",
+            (username.strip(), hash_password(password)),
+        ).fetchone()
+    return _user_from_row(row)
+
+
+def get_customer(customer_id: str) -> dict | None:
+    with get_db_connection() as conn:
+        row = conn.execute("SELECT * FROM customers WHERE customer_id = ?", (customer_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_users() -> list[dict]:
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT user_id, username, role, group_name, assigned_customer_ids
+            FROM users
+            ORDER BY username
+            """
+        ).fetchall()
+    return [_user_from_row(r) for r in rows]
+
+
+def list_customers() -> list[dict]:
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT customer_id, customer_name, customer_code, group_name, assigned_staff_username
+            FROM customers
+            ORDER BY customer_code
+            """
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def sync_staff_customer_assignments() -> None:
+    with get_db_connection() as conn:
+        staff_rows = conn.execute(
+            "SELECT username FROM users WHERE role = 'staff' ORDER BY username"
+        ).fetchall()
+        for staff in staff_rows:
+            customer_rows = conn.execute(
+                """
+                SELECT customer_id
+                FROM customers
+                WHERE assigned_staff_username = ?
+                ORDER BY customer_code
+                """,
+                (staff["username"],),
+            ).fetchall()
+            assigned = [r["customer_id"] for r in customer_rows]
+            conn.execute(
+                """
+                UPDATE users
+                SET assigned_customer_ids = ?
+                WHERE username = ?
+                """,
+                (json.dumps(assigned, ensure_ascii=False), staff["username"]),
+            )
+
+
+def create_user(
+    username: str,
+    password: str,
+    role: str,
+    group_name: str = "",
+) -> None:
+    username = username.strip()
+    if not username or not password:
+        raise ValueError("用户名和密码不能为空")
+    if role not in {"company_admin", "group_leader", "staff"}:
+        raise ValueError("角色不正确")
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (user_id, username, password_hash, role, group_name, assigned_customer_ids)
+            VALUES (?, ?, ?, ?, ?, '[]')
+            """,
+            (f"u_{username}", username, hash_password(password), role, group_name.strip()),
+        )
+    sync_staff_customer_assignments()
+
+
+def update_user(
+    username: str,
+    role: str,
+    group_name: str = "",
+    new_password: str = "",
+) -> None:
+    if role not in {"company_admin", "group_leader", "staff"}:
+        raise ValueError("角色不正确")
+    with get_db_connection() as conn:
+        if new_password.strip():
+            conn.execute(
+                """
+                UPDATE users
+                SET password_hash = ?, role = ?, group_name = ?
+                WHERE username = ?
+                """,
+                (hash_password(new_password), role, group_name.strip(), username),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE users
+                SET role = ?, group_name = ?
+                WHERE username = ?
+                """,
+                (role, group_name.strip(), username),
+            )
+    sync_staff_customer_assignments()
+
+
+def create_customer(
+    customer_id: str,
+    customer_name: str,
+    customer_code: str,
+    group_name: str,
+    assigned_staff_username: str,
+) -> None:
+    values = [customer_id.strip(), customer_name.strip(), customer_code.strip(),
+              group_name.strip(), assigned_staff_username.strip()]
+    if not all(values):
+        raise ValueError("客户 ID、客户名称、客户代码、小组、负责人都不能为空")
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO customers (
+                customer_id, customer_name, customer_code, group_name, assigned_staff_username
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            tuple(values),
+        )
+    sync_staff_customer_assignments()
+
+
+def update_customer(
+    customer_id: str,
+    customer_name: str,
+    customer_code: str,
+    group_name: str,
+    assigned_staff_username: str,
+) -> None:
+    values = [customer_name.strip(), customer_code.strip(), group_name.strip(),
+              assigned_staff_username.strip(), customer_id]
+    if not all(values):
+        raise ValueError("客户名称、客户代码、小组、负责人都不能为空")
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            UPDATE customers
+            SET customer_name = ?, customer_code = ?, group_name = ?, assigned_staff_username = ?
+            WHERE customer_id = ?
+            """,
+            tuple(values),
+        )
+    sync_staff_customer_assignments()
+
+
+def get_accessible_customers(user: dict) -> list[dict]:
+    if not user:
+        return []
+    with get_db_connection() as conn:
+        if user["role"] == "company_admin":
+            rows = conn.execute(
+                "SELECT * FROM customers ORDER BY customer_code"
+            ).fetchall()
+        elif user["role"] == "group_leader":
+            rows = conn.execute(
+                "SELECT * FROM customers WHERE group_name = ? ORDER BY customer_code",
+                (user.get("group_name") or "",),
+            ).fetchall()
+        else:
+            assigned = user.get("assigned_customer_ids") or []
+            if not assigned:
+                return []
+            placeholders = ",".join("?" for _ in assigned)
+            rows = conn.execute(
+                f"SELECT * FROM customers WHERE customer_id IN ({placeholders}) ORDER BY customer_code",
+                assigned,
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def can_view_customer_glossary(user: dict, customer_id: str) -> bool:
+    if not user or not customer_id:
+        return False
+    if user["role"] == "company_admin":
+        return True
+    if user["role"] == "staff":
+        return customer_id in (user.get("assigned_customer_ids") or [])
+    customer = get_customer(customer_id)
+    return bool(customer and customer["group_name"] == user.get("group_name"))
+
+
+def can_use_customer_glossary(user: dict, customer_id: str) -> bool:
+    return can_view_customer_glossary(user, customer_id)
+
+
+def can_submit_glossary_change(user: dict, customer_id: str) -> bool:
+    return can_view_customer_glossary(user, customer_id)
+
+
+def can_approve_glossary_change(user: dict) -> bool:
+    return bool(user and user.get("role") == "company_admin")
+
+
+def get_customer_glossary_df(customer_id: str) -> pd.DataFrame:
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT english_term, chinese_translation, note
+            FROM glossary_terms
+            WHERE customer_id = ? AND status = 'active'
+            ORDER BY lower(english_term)
+            """,
+            (customer_id,),
+        ).fetchall()
+    return pd.DataFrame(
+        [
+            {
+                _GLOSSARY_EN_COL: r["english_term"],
+                _GLOSSARY_ZH_COL: r["chinese_translation"],
+                _GLOSSARY_NOTE_COL: r["note"] or "",
+                _GLOSSARY_CAT_COL: customer_id,
+            }
+            for r in rows
+        ],
+        columns=_GLOSSARY_EDIT_COLS,
+    )
+
+
+def get_customer_glossary_bytes_for_translation(user: dict, customer_id: str) -> bytes:
+    if not can_use_customer_glossary(user, customer_id):
+        raise PermissionError("当前用户无权使用该客户术语库")
+    return glossary_df_to_xlsx_bytes(get_customer_glossary_df(customer_id))
+
+
+def get_active_glossary_terms(customer_id: str) -> list[dict]:
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT glossary_id, customer_id, english_term, chinese_translation, note,
+                   created_by, updated_by, updated_at, status
+            FROM glossary_terms
+            WHERE customer_id = ? AND status = 'active'
+            ORDER BY lower(english_term)
+            """,
+            (customer_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_active_glossary_term(customer_id: str, english_term: str) -> dict | None:
+    with get_db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM glossary_terms
+            WHERE customer_id = ? AND lower(english_term) = lower(?) AND status = 'active'
+            ORDER BY glossary_id DESC
+            LIMIT 1
+            """,
+            (customer_id, english_term.strip()),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_glossary_change_request(
+    user: dict,
+    customer_id: str,
+    action_type: str,
+    english_term_old: str = "",
+    chinese_translation_old: str = "",
+    english_term_new: str = "",
+    chinese_translation_new: str = "",
+    note: str = "",
+) -> int:
+    if action_type not in {"add", "update", "delete"}:
+        raise ValueError("不支持的术语申请类型")
+    if not can_submit_glossary_change(user, customer_id):
+        raise PermissionError("当前用户无权提交该客户的术语修改申请")
+
+    with get_db_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO glossary_change_requests (
+                customer_id, action_type,
+                english_term_old, chinese_translation_old,
+                english_term_new, chinese_translation_new,
+                note, submitted_by, submitted_at, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+            """,
+            (
+                customer_id,
+                action_type,
+                english_term_old.strip(),
+                chinese_translation_old.strip(),
+                english_term_new.strip(),
+                chinese_translation_new.strip(),
+                note.strip(),
+                user["username"],
+                _now_iso(),
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def list_glossary_change_requests(
+    status: str | None = None,
+    customer_id: str | None = None,
+    submitted_by: str | None = None,
+    action_type: str | None = None,
+) -> list[dict]:
+    where = []
+    params = []
+    if status:
+        where.append("r.status = ?")
+        params.append(status)
+    if customer_id:
+        where.append("r.customer_id = ?")
+        params.append(customer_id)
+    if submitted_by:
+        where.append("r.submitted_by = ?")
+        params.append(submitted_by)
+    if action_type:
+        where.append("r.action_type = ?")
+        params.append(action_type)
+
+    sql = """
+        SELECT r.*, c.customer_code, c.customer_name
+        FROM glossary_change_requests r
+        LEFT JOIN customers c ON c.customer_id = r.customer_id
+    """
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY r.submitted_at DESC, r.request_id DESC"
+
+    with get_db_connection() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _apply_approved_glossary_change(conn: sqlite3.Connection, request_row: sqlite3.Row) -> None:
+    action = request_row["action_type"]
+    customer_id = request_row["customer_id"]
+    reviewer = request_row["reviewed_by"]
+    now = request_row["reviewed_at"]
+
+    if action == "add":
+        existing = conn.execute(
+            """
+            SELECT glossary_id
+            FROM glossary_terms
+            WHERE customer_id = ? AND lower(english_term) = lower(?) AND status = 'active'
+            ORDER BY glossary_id DESC
+            LIMIT 1
+            """,
+            (customer_id, request_row["english_term_new"]),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE glossary_terms
+                SET chinese_translation = ?, note = ?, updated_by = ?, updated_at = ?, status = 'active'
+                WHERE glossary_id = ?
+                """,
+                (
+                    request_row["chinese_translation_new"],
+                    request_row["note"] or "",
+                    reviewer,
+                    now,
+                    existing["glossary_id"],
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO glossary_terms (
+                    customer_id, english_term, chinese_translation, note,
+                    created_by, updated_by, updated_at, status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
+                """,
+                (
+                    customer_id,
+                    request_row["english_term_new"],
+                    request_row["chinese_translation_new"],
+                    request_row["note"] or "",
+                    request_row["submitted_by"],
+                    reviewer,
+                    now,
+                ),
+            )
+    elif action == "update":
+        conn.execute(
+            """
+            UPDATE glossary_terms
+            SET english_term = ?, chinese_translation = ?, note = ?,
+                updated_by = ?, updated_at = ?, status = 'active'
+            WHERE customer_id = ? AND lower(english_term) = lower(?) AND status = 'active'
+            """,
+            (
+                request_row["english_term_new"],
+                request_row["chinese_translation_new"],
+                request_row["note"] or "",
+                reviewer,
+                now,
+                customer_id,
+                request_row["english_term_old"],
+            ),
+        )
+    elif action == "delete":
+        conn.execute(
+            """
+            UPDATE glossary_terms
+            SET status = 'inactive', updated_by = ?, updated_at = ?
+            WHERE customer_id = ? AND lower(english_term) = lower(?) AND status = 'active'
+            """,
+            (reviewer, now, customer_id, request_row["english_term_old"]),
+        )
+
+
+def approve_glossary_change_request(request_id: int, reviewer: dict, comment: str = "") -> None:
+    if not can_approve_glossary_change(reviewer):
+        raise PermissionError("当前用户无权审批术语申请")
+    with get_db_connection() as conn:
+        now = _now_iso()
+        conn.execute(
+            """
+            UPDATE glossary_change_requests
+            SET status = 'approved', reviewed_by = ?, reviewed_at = ?, review_comment = ?
+            WHERE request_id = ? AND status = 'pending'
+            """,
+            (reviewer["username"], now, comment.strip(), request_id),
+        )
+        request_row = conn.execute(
+            "SELECT * FROM glossary_change_requests WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        if request_row is None or request_row["status"] != "approved":
+            raise ValueError("申请不存在或已被处理")
+        _apply_approved_glossary_change(conn, request_row)
+
+
+def reject_glossary_change_request(request_id: int, reviewer: dict, comment: str = "") -> None:
+    if not can_approve_glossary_change(reviewer):
+        raise PermissionError("当前用户无权审批术语申请")
+    with get_db_connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE glossary_change_requests
+            SET status = 'rejected', reviewed_by = ?, reviewed_at = ?, review_comment = ?
+            WHERE request_id = ? AND status = 'pending'
+            """,
+            (reviewer["username"], _now_iso(), comment.strip(), request_id),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("申请不存在或已被处理")
+
+
+def render_login_panel() -> dict | None:
+    current_user = st.session_state.get("current_user")
+    if current_user:
+        with st.sidebar:
+            st.subheader("当前用户")
+            st.write(f"用户名：**{current_user['username']}**")
+            st.write(f"角色：`{current_user['role']}`")
+            if current_user.get("group_name"):
+                st.write(f"小组：**{current_user['group_name']}**")
+
+            accessible = get_accessible_customers(current_user)
+            st.caption(f"可访问客户：{len(accessible)} 个")
+            if accessible:
+                st.dataframe(
+                    pd.DataFrame(accessible)[
+                        ["customer_code", "customer_name", "group_name", "assigned_staff_username"]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            if st.button("退出登录", use_container_width=True):
+                for key in ("current_user", "selected_customer_id"):
+                    st.session_state.pop(key, None)
+                st.rerun()
+        return current_user
+
+    st.subheader("登录")
+    st.caption("第一版本地账号，用于验证客户术语库权限。")
+    with st.form("login_form"):
+        username = st.text_input("用户名")
+        password = st.text_input("密码", type="password")
+        submitted = st.form_submit_button("登录", use_container_width=True, type="primary")
+
+    if submitted:
+        user = authenticate_user(username, password)
+        if user:
+            st.session_state["current_user"] = user
+            st.rerun()
+        st.error("用户名或密码不正确")
+
+    st.info(
+        "测试账号：admin/admin123，leader_a/leader123，"
+        "staff_1/staff123，staff_2/staff123，staff_3/staff123"
+    )
+    return None
+
+
+def render_customer_selector(user: dict) -> str | None:
+    accessible = get_accessible_customers(user)
+    valid_ids = [c["customer_id"] for c in accessible]
+    selected = st.session_state.get("selected_customer_id")
+    if selected not in valid_ids:
+        st.session_state.pop("selected_customer_id", None)
+        selected = None
+
+    st.subheader("客户选择")
+    if not accessible:
+        st.warning("当前用户没有可访问客户。")
+        return None
+
+    labels = {
+        c["customer_id"]: (
+            f"{c['customer_code']} / {c['customer_name']} / "
+            f"{c['group_name']} / {c['assigned_staff_username']}"
+        )
+        for c in accessible
+    }
+    default_index = valid_ids.index(selected) if selected in valid_ids else 0
+    selected_customer_id = st.selectbox(
+        "当前客户",
+        valid_ids,
+        index=default_index,
+        format_func=lambda cid: labels.get(cid, cid),
+        key="selected_customer_id",
+    )
+    st.caption("后续 PDF / Excel 翻译会使用这里选择的客户术语库。")
+    return selected_customer_id
 
 
 # ── Glossary helpers ───────────────────────────────────────────────────────────
@@ -1356,12 +2050,27 @@ st.set_page_config(
     page_title="服装行业翻译引擎",
     page_icon="🧵",
     layout="centered",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 st.title("🧵 服装行业翻译引擎")
 st.caption("支持 PDF 与 Excel (.xlsx) 双格式 · 上传文件 + 术语库 · 调用 Claude 自动翻译为中文")
 st.divider()
+
+init_db()
+seed_demo_data_if_empty()
+sync_staff_customer_assignments()
+current_user = render_login_panel()
+if not current_user:
+    st.stop()
+selected_customer_id = render_customer_selector(current_user)
+if selected_customer_id:
+    selected_customer = get_customer(selected_customer_id)
+    if selected_customer:
+        st.info(
+            f"当前选择客户：**{selected_customer['customer_code']} / "
+            f"{selected_customer['customer_name']}**（{selected_customer['group_name']}）"
+        )
 
 # ── 会话内术语库初始化 ─────────────────────────────────────────────────────────
 if "glossary_df" not in st.session_state:
@@ -1380,7 +2089,16 @@ api_key = st.text_input(
 )
 st.divider()
 
-tab_pdf, tab_excel, tab_glossary = st.tabs(["📄 PDF 翻译（支持批量）", "📊 Excel 翻译", "📚 术语库管理"])
+tab_labels = ["📄 PDF 翻译（支持批量）", "📊 Excel 翻译", "📚 客户术语库"]
+if can_approve_glossary_change(current_user):
+    tab_labels.append("✅ 术语审批")
+    tab_labels.append("👤 用户管理")
+    tab_labels.append("🏢 客户管理")
+tabs = st.tabs(tab_labels)
+tab_pdf, tab_excel, tab_glossary = tabs[:3]
+tab_approval = tabs[3] if len(tabs) > 3 else None
+tab_user_admin = tabs[4] if len(tabs) > 4 else None
+tab_customer_admin = tabs[5] if len(tabs) > 5 else None
 
 # ════════════════════════════════════════════════════════════════════════════
 #  PDF Tab — batch upload, independent processing per file
@@ -1399,9 +2117,11 @@ with tab_pdf:
     )
     font_file = st.file_uploader(font_label, type=["ttf"], key="pdf_font_uploader")
     font_ready = bool(font_file or DEFAULT_FONT.exists())
-    st.caption(f"📚 当前术语库：**{st.session_state['glossary_source']}** · {len(glossary_df_to_dict(st.session_state['glossary_df']))} 条术语（可在「术语库管理」标签页编辑）")
+    selected_glossary_count = len(get_customer_glossary_df(selected_customer_id)) if selected_customer_id else 0
+    st.caption(f"📚 当前客户术语库：**{selected_customer_id or '未选择'}** · {selected_glossary_count} 条 active 术语")
 
-    can_start_pdf = bool(pdf_files and api_key and font_ready)
+    customer_ready = bool(selected_customer_id and can_use_customer_glossary(current_user, selected_customer_id))
+    can_start_pdf = bool(pdf_files and api_key and font_ready and customer_ready)
     if not can_start_pdf:
         missing = []
         if not pdf_files:
@@ -1410,6 +2130,8 @@ with tab_pdf:
             missing.append("Anthropic API Key")
         if not font_ready:
             missing.append("中文字体 TTF")
+        if not customer_ready:
+            missing.append("有权限的客户")
         st.info(f"请先提供：{'、'.join(missing)}")
 
     start_pdf_btn = st.button(
@@ -1432,7 +2154,10 @@ with tab_pdf:
             else:
                 font_path = str(DEFAULT_FONT)
 
-            glossary_bytes = glossary_df_to_xlsx_bytes(st.session_state["glossary_df"])
+            glossary_bytes = get_customer_glossary_bytes_for_translation(
+                current_user,
+                selected_customer_id,
+            )
 
             overall = st.progress(0.0, text=f"准备处理 {len(pdf_files)} 个文件…")
             results = []
@@ -1576,15 +2301,19 @@ with tab_excel:
         accept_multiple_files=True,
         key="excel_uploader",
     )
-    st.caption(f"📚 当前术语库：**{st.session_state['glossary_source']}** · {len(glossary_df_to_dict(st.session_state['glossary_df']))} 条术语（可在「术语库管理」标签页编辑）")
+    selected_glossary_count = len(get_customer_glossary_df(selected_customer_id)) if selected_customer_id else 0
+    st.caption(f"📚 当前客户术语库：**{selected_customer_id or '未选择'}** · {selected_glossary_count} 条 active 术语")
 
-    can_start_excel = bool(excel_files and api_key)
+    customer_ready = bool(selected_customer_id and can_use_customer_glossary(current_user, selected_customer_id))
+    can_start_excel = bool(excel_files and api_key and customer_ready)
     if not can_start_excel:
         missing = []
         if not excel_files:
             missing.append("Excel 文件")
         if not api_key:
             missing.append("Anthropic API Key")
+        if not customer_ready:
+            missing.append("有权限的客户")
         st.info(f"请先提供：{'、'.join(missing)}")
 
     translate_images_checked = st.checkbox(
@@ -1606,7 +2335,10 @@ with tab_excel:
     if start_excel_btn:
         st.session_state["excel_batch_results"] = []
 
-        glossary_bytes = glossary_df_to_xlsx_bytes(st.session_state["glossary_df"])
+        glossary_bytes = get_customer_glossary_bytes_for_translation(
+            current_user,
+            selected_customer_id,
+        )
         glossary_dict = load_glossary(glossary_bytes)
         overall = st.progress(0.0, text=f"准备处理 {len(excel_files)} 个文件…")
         results = []
@@ -1731,126 +2463,397 @@ with tab_excel:
                     st.error(r["error"])
 
 # ════════════════════════════════════════════════════════════════════════════
-#  Glossary Management Tab
+#  Customer Glossary Tab
 # ════════════════════════════════════════════════════════════════════════════
 with tab_glossary:
-    glossary_df = st.session_state["glossary_df"]
-    n_complete = len(glossary_df_to_dict(glossary_df))
-    n_incomplete = len(glossary_df) - n_complete
-    st.caption(
-        f"当前术语库来源：**{st.session_state['glossary_source']}** ｜ "
-        f"完整术语 **{n_complete}** 条，待补充翻译 **{n_incomplete}** 条"
-    )
-
-    # ── ① 上传替换 ──────────────────────────────────────────────────────────
-    st.markdown("#### ① 上传术语库（将替换当前术语库）")
-    uploaded_glossary = st.file_uploader(
-        "上传术语库 Excel（表头需包含「英文」「中文」列）",
-        type=["xlsx", "xls"],
-        key="glossary_replace_uploader",
-    )
-    if uploaded_glossary is not None:
-        new_df, missing_cols = parse_glossary_excel(uploaded_glossary.read())
-        if missing_cols:
-            st.error("术语库格式不正确，缺少以下列：\n\n" + "\n".join(f"- {m}" for m in missing_cols))
-        else:
-            preview_cleaned, preview_conflicts, preview_incomplete = clean_glossary_df(new_df)
-            st.info(
-                f"解析成功：完整术语 **{len(glossary_df_to_dict(preview_cleaned))}** 条，"
-                f"待补充翻译 **{preview_incomplete}** 条。点击下方按钮应用，将替换当前术语库。"
-            )
-            if st.button("✅ 应用此术语库", key="apply_uploaded_glossary"):
-                st.session_state["glossary_df"] = preview_cleaned
-                st.session_state["glossary_conflicts"] = preview_conflicts
-                st.session_state["glossary_source"] = uploaded_glossary.name
-                st.rerun()
-
-    st.divider()
-
-    # ── ② 查看 + 搜索 ───────────────────────────────────────────────────────
-    st.markdown("#### ② 查看当前术语库")
-    search_kw = st.text_input("🔍 搜索（英文 / 中文 / 备注 / 分类）", key="glossary_search")
-    view_df = st.session_state["glossary_df"]
-    if search_kw.strip():
-        kw = search_kw.strip().lower()
-        mask = view_df.apply(lambda r: kw in " ".join(str(v).lower() for v in r), axis=1)
-        view_df = view_df[mask]
-    st.dataframe(view_df, use_container_width=True, height=300)
-
-    st.divider()
-
-    # ── ③ 增 / 改 / 删 ──────────────────────────────────────────────────────
-    st.markdown("#### ③ 新增 / 修改 / 删除术语")
-    st.caption("直接编辑表格；选中整行后可删除；在底部空行新增。编辑完成后点击「保存」才会生效。")
-    edited_df = st.data_editor(
-        st.session_state["glossary_df"][_GLOSSARY_EDIT_COLS],
-        num_rows="dynamic",
-        use_container_width=True,
-        key="glossary_editor",
-    )
-    if st.button("💾 保存术语库修改", use_container_width=True, type="primary", key="save_glossary_edits"):
-        cleaned, conflicts, n_incomplete_after = clean_glossary_df(edited_df)
-        st.session_state["glossary_df"] = cleaned
-        st.session_state["glossary_conflicts"] = conflicts
-        st.session_state["glossary_source"] = "手动编辑"
-        if not conflicts.empty:
-            st.warning(f"检测到 {len(conflicts)} 处英文术语重复且翻译不同，已自动采用最新一条翻译。")
-        st.success(f"已保存：完整术语 {len(glossary_df_to_dict(cleaned))} 条，待补充翻译 {n_incomplete_after} 条。")
-        st.rerun()
-
-    st.divider()
-
-    # ── ④ 未收录术语回填 ────────────────────────────────────────────────────
-    st.markdown("#### ④ 未收录术语回填")
-    st.caption("上传 PDF/Excel 翻译后下载的「未收录术语」文件，在其中新增「中文翻译」列填好后再上传，系统会自动合并进当前术语库。")
-    unrecorded_upload = st.file_uploader(
-        "上传补充翻译后的未收录术语 Excel",
-        type=["xlsx", "xls"],
-        key="unrecorded_uploader",
-    )
-    if unrecorded_upload is not None:
-        unrecorded_df, missing_cols = parse_unrecorded_excel(unrecorded_upload.read())
-        if missing_cols:
-            st.error("文件格式不正确，缺少以下列：\n\n" + "\n".join(f"- {m}" for m in missing_cols))
-        else:
-            if st.button("🔀 合并到当前术语库", key="merge_unrecorded_btn"):
-                merged, conflicts, n_added, n_overwritten, n_skipped = merge_unrecorded_into_glossary(
-                    st.session_state["glossary_df"], unrecorded_df
-                )
-                cleaned, extra_conflicts, _ = clean_glossary_df(merged)
-                all_conflicts = pd.concat([conflicts, extra_conflicts], ignore_index=True)
-                st.session_state["glossary_df"] = cleaned
-                st.session_state["glossary_conflicts"] = all_conflicts
-                st.session_state["glossary_source"] = "术语库 + 未收录术语回填"
-                msg = f"合并完成：新增 **{n_added}** 条，覆盖更新 **{n_overwritten}** 条"
-                if n_skipped:
-                    msg += f"，跳过 **{n_skipped}** 条未填写中文翻译的行"
-                st.success(msg)
-                st.rerun()
-
-    st.divider()
-
-    # ── ⑤ 下载 ──────────────────────────────────────────────────────────────
-    st.markdown("#### ⑤ 下载")
-    dl1, dl2 = st.columns(2)
-    with dl1:
-        st.download_button(
-            label="⬇️  下载 updated_glossary.xlsx",
-            data=glossary_df_to_xlsx_bytes(st.session_state["glossary_df"]),
-            file_name="updated_glossary.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            type="primary",
+    if not selected_customer_id or not can_view_customer_glossary(current_user, selected_customer_id):
+        st.error("请先选择一个有权限访问的客户。")
+    else:
+        customer = get_customer(selected_customer_id)
+        st.caption(
+            f"当前客户：**{customer['customer_code']} / {customer['customer_name']}** ｜ "
+            f"小组：**{customer['group_name']}** ｜ 负责人：**{customer['assigned_staff_username']}**"
         )
-    with dl2:
-        conflicts_now = st.session_state.get("glossary_conflicts")
-        if conflicts_now is not None and not conflicts_now.empty:
-            st.download_button(
-                label=f"⬇️  下载 conflict_report.xlsx（{len(conflicts_now)} 条）",
-                data=_df_to_simple_xlsx(conflicts_now, "Conflicts"),
-                file_name="conflict_report.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+
+        terms = get_active_glossary_terms(selected_customer_id)
+        terms_df = pd.DataFrame(terms)
+        if terms_df.empty:
+            st.info("当前客户还没有 active 术语。")
         else:
-            st.caption("暂无术语冲突")
+            display_df = terms_df[
+                ["english_term", "chinese_translation", "note", "updated_by", "updated_at"]
+            ].rename(columns={
+                "english_term": "英文术语",
+                "chinese_translation": "中文翻译",
+                "note": "备注",
+                "updated_by": "最后更新人",
+                "updated_at": "最后更新时间",
+            })
+            st.dataframe(display_df, use_container_width=True, height=260, hide_index=True)
+
+        st.divider()
+        st.subheader("提交术语修改申请")
+        st.caption("新增、修改、删除只生成 pending 申请；正式术语库不会被直接改动。")
+
+        can_submit = can_submit_glossary_change(current_user, selected_customer_id)
+        if not can_submit:
+            st.warning("当前用户无权提交该客户的术语修改申请。")
+        else:
+            add_tab, update_tab, delete_tab = st.tabs(["申请新增术语", "申请修改术语", "申请删除术语"])
+
+            with add_tab:
+                with st.form("glossary_add_request_form"):
+                    en_new = st.text_input("英文术语", key="add_en")
+                    zh_new = st.text_input("中文翻译", key="add_zh")
+                    note = st.text_area("备注", key="add_note")
+                    submitted = st.form_submit_button("提交新增申请", type="primary", use_container_width=True)
+                if submitted:
+                    if not en_new.strip() or not zh_new.strip():
+                        st.error("英文术语和中文翻译不能为空。")
+                    else:
+                        req_id = create_glossary_change_request(
+                            current_user,
+                            selected_customer_id,
+                            "add",
+                            english_term_new=en_new,
+                            chinese_translation_new=zh_new,
+                            note=note,
+                        )
+                        st.success(f"已提交新增申请，申请编号 #{req_id}。等待公司管理员审批。")
+
+            with update_tab:
+                if not terms:
+                    st.info("当前客户没有可修改的 active 术语。")
+                else:
+                    term_options = [t["english_term"] for t in terms]
+                    selected_term = st.selectbox("选择要修改的术语", term_options, key="update_term_select")
+                    old_term = get_active_glossary_term(selected_customer_id, selected_term)
+                    with st.form("glossary_update_request_form"):
+                        st.text_input("原英文术语", value=old_term["english_term"], disabled=True)
+                        st.text_input("原中文翻译", value=old_term["chinese_translation"], disabled=True)
+                        en_new = st.text_input("新英文术语", value=old_term["english_term"], key="update_en")
+                        zh_new = st.text_input("新中文翻译", value=old_term["chinese_translation"], key="update_zh")
+                        note = st.text_area("备注", value=old_term.get("note") or "", key="update_note")
+                        submitted = st.form_submit_button("提交修改申请", type="primary", use_container_width=True)
+                    if submitted:
+                        if not en_new.strip() or not zh_new.strip():
+                            st.error("新英文术语和新中文翻译不能为空。")
+                        else:
+                            req_id = create_glossary_change_request(
+                                current_user,
+                                selected_customer_id,
+                                "update",
+                                english_term_old=old_term["english_term"],
+                                chinese_translation_old=old_term["chinese_translation"],
+                                english_term_new=en_new,
+                                chinese_translation_new=zh_new,
+                                note=note,
+                            )
+                            st.success(f"已提交修改申请，申请编号 #{req_id}。等待公司管理员审批。")
+
+            with delete_tab:
+                if not terms:
+                    st.info("当前客户没有可删除的 active 术语。")
+                else:
+                    term_options = [t["english_term"] for t in terms]
+                    selected_term = st.selectbox("选择要删除的术语", term_options, key="delete_term_select")
+                    old_term = get_active_glossary_term(selected_customer_id, selected_term)
+                    with st.form("glossary_delete_request_form"):
+                        st.text_input("英文术语", value=old_term["english_term"], disabled=True)
+                        st.text_input("中文翻译", value=old_term["chinese_translation"], disabled=True)
+                        note = st.text_area("删除原因 / 备注", key="delete_note")
+                        submitted = st.form_submit_button("提交删除申请", type="primary", use_container_width=True)
+                    if submitted:
+                        req_id = create_glossary_change_request(
+                            current_user,
+                            selected_customer_id,
+                            "delete",
+                            english_term_old=old_term["english_term"],
+                            chinese_translation_old=old_term["chinese_translation"],
+                            note=note,
+                        )
+                        st.success(f"已提交删除申请，申请编号 #{req_id}。等待公司管理员审批。")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Approval Tab
+# ════════════════════════════════════════════════════════════════════════════
+if tab_approval is not None:
+    with tab_approval:
+        st.caption("仅 company_admin 可见。审批通过后才会写入正式客户术语库。")
+
+        all_customers = get_accessible_customers(current_user)
+        customer_filter_options = ["全部"] + [c["customer_id"] for c in all_customers]
+        customer_labels = {
+            c["customer_id"]: f"{c['customer_code']} / {c['customer_name']}"
+            for c in all_customers
+        }
+        fc, fa, fs = st.columns(3)
+        with fc:
+            customer_filter = st.selectbox(
+                "客户筛选",
+                customer_filter_options,
+                format_func=lambda cid: "全部" if cid == "全部" else customer_labels.get(cid, cid),
+                key="approval_customer_filter",
+            )
+        with fa:
+            action_filter = st.selectbox("申请类型", ["全部", "add", "update", "delete"], key="approval_action_filter")
+        with fs:
+            submitted_by_filter = st.text_input("申请人筛选", key="approval_submitter_filter")
+
+        pending = list_glossary_change_requests(
+            status="pending",
+            customer_id=None if customer_filter == "全部" else customer_filter,
+            submitted_by=submitted_by_filter.strip() or None,
+            action_type=None if action_filter == "全部" else action_filter,
+        )
+
+        if not pending:
+            st.info("当前没有符合条件的 pending 申请。")
+        else:
+            pending_df = pd.DataFrame(pending)
+            st.dataframe(
+                pending_df[[
+                    "request_id", "customer_code", "customer_name", "action_type",
+                    "english_term_old", "chinese_translation_old",
+                    "english_term_new", "chinese_translation_new",
+                    "submitted_by", "submitted_at",
+                ]],
+                use_container_width=True,
+                hide_index=True,
+                height=260,
+            )
+
+            request_ids = [int(r["request_id"]) for r in pending]
+            selected_request_id = st.selectbox("选择要审批的申请", request_ids, key="approval_request_select")
+            selected_request = next(r for r in pending if int(r["request_id"]) == int(selected_request_id))
+
+            st.markdown("#### 申请详情")
+            detail_cols = st.columns(2)
+            with detail_cols[0]:
+                st.write(f"客户：**{selected_request['customer_code']} / {selected_request['customer_name']}**")
+                st.write(f"类型：`{selected_request['action_type']}`")
+                st.write(f"申请人：**{selected_request['submitted_by']}**")
+                st.write(f"提交时间：{selected_request['submitted_at']}")
+            with detail_cols[1]:
+                st.write(f"旧英文：{selected_request['english_term_old'] or ''}")
+                st.write(f"旧中文：{selected_request['chinese_translation_old'] or ''}")
+                st.write(f"新英文：{selected_request['english_term_new'] or ''}")
+                st.write(f"新中文：{selected_request['chinese_translation_new'] or ''}")
+            if selected_request.get("note"):
+                st.info(f"备注：{selected_request['note']}")
+
+            with st.form("approval_decision_form"):
+                review_comment = st.text_area("审核意见", key="approval_comment")
+                approve_col, reject_col = st.columns(2)
+                with approve_col:
+                    approve_clicked = st.form_submit_button("通过申请", type="primary", use_container_width=True)
+                with reject_col:
+                    reject_clicked = st.form_submit_button("拒绝申请", use_container_width=True)
+
+            if approve_clicked:
+                try:
+                    approve_glossary_change_request(selected_request_id, current_user, review_comment)
+                    st.success(f"已通过申请 #{selected_request_id}，正式术语库已更新。")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+            if reject_clicked:
+                try:
+                    reject_glossary_change_request(selected_request_id, current_user, review_comment)
+                    st.success(f"已拒绝申请 #{selected_request_id}，正式术语库未改变。")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  User Admin Tab
+# ════════════════════════════════════════════════════════════════════════════
+if tab_user_admin is not None:
+    with tab_user_admin:
+        st.caption("仅 company_admin 可见。客户分配以「客户管理」中的负责人为准。")
+        users = list_users()
+        users_df = pd.DataFrame(users)
+        if not users_df.empty:
+            display_users = users_df.copy()
+            display_users["assigned_customer_ids"] = display_users["assigned_customer_ids"].apply(
+                lambda ids: ", ".join(ids) if ids else ""
+            )
+            st.dataframe(
+                display_users[["username", "role", "group_name", "assigned_customer_ids"]],
+                use_container_width=True,
+                hide_index=True,
+                height=240,
+            )
+
+        st.divider()
+        add_user_tab, edit_user_tab = st.tabs(["新增账号", "修改账号"])
+
+        with add_user_tab:
+            with st.form("create_user_form"):
+                username = st.text_input("用户名", key="create_user_username")
+                password = st.text_input("初始密码", type="password", key="create_user_password")
+                role = st.selectbox(
+                    "角色",
+                    ["staff", "group_leader", "company_admin"],
+                    key="create_user_role",
+                )
+                group_name = st.text_input("小组", key="create_user_group")
+                submitted = st.form_submit_button("创建账号", type="primary", use_container_width=True)
+            if submitted:
+                try:
+                    create_user(username, password, role, group_name)
+                    st.success(f"已创建账号 {username.strip()}。")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+        with edit_user_tab:
+            if not users:
+                st.info("当前没有用户。")
+            else:
+                usernames = [u["username"] for u in users]
+                selected_username = st.selectbox("选择账号", usernames, key="edit_user_select")
+                selected_user = next(u for u in users if u["username"] == selected_username)
+                with st.form("update_user_form"):
+                    role = st.selectbox(
+                        "角色",
+                        ["staff", "group_leader", "company_admin"],
+                        index=["staff", "group_leader", "company_admin"].index(selected_user["role"]),
+                        key="edit_user_role",
+                    )
+                    group_name = st.text_input(
+                        "小组",
+                        value=selected_user.get("group_name") or "",
+                        key="edit_user_group",
+                    )
+                    new_password = st.text_input(
+                        "新密码（留空则不修改）",
+                        type="password",
+                        key="edit_user_password",
+                    )
+                    st.caption(
+                        "该账号负责客户："
+                        + (", ".join(selected_user.get("assigned_customer_ids") or []) or "无")
+                    )
+                    submitted = st.form_submit_button("保存账号修改", type="primary", use_container_width=True)
+                if submitted:
+                    try:
+                        update_user(selected_username, role, group_name, new_password)
+                        if selected_username == current_user["username"]:
+                            st.session_state["current_user"] = authenticate_user(
+                                selected_username,
+                                new_password if new_password.strip() else "",
+                            ) or {**current_user, "role": role, "group_name": group_name}
+                        st.success(f"已更新账号 {selected_username}。")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Customer Admin Tab
+# ════════════════════════════════════════════════════════════════════════════
+if tab_customer_admin is not None:
+    with tab_customer_admin:
+        st.caption("仅 company_admin 可见。修改负责人后会同步 staff 的 assigned_customer_ids。")
+        customers = list_customers()
+        staff_users = [u for u in list_users() if u["role"] == "staff"]
+        staff_usernames = [u["username"] for u in staff_users]
+        customers_df = pd.DataFrame(customers)
+        if not customers_df.empty:
+            st.dataframe(
+                customers_df[[
+                    "customer_id", "customer_code", "customer_name",
+                    "group_name", "assigned_staff_username",
+                ]],
+                use_container_width=True,
+                hide_index=True,
+                height=240,
+            )
+
+        st.divider()
+        add_customer_tab, edit_customer_tab = st.tabs(["新增客户", "修改客户"])
+
+        with add_customer_tab:
+            if not staff_usernames:
+                st.warning("请先创建 staff 账号，再新增客户。")
+            else:
+                with st.form("create_customer_form"):
+                    customer_id = st.text_input("客户 ID", placeholder="例如 CUST004", key="create_customer_id")
+                    customer_code = st.text_input("客户代码", placeholder="例如 CUST004", key="create_customer_code")
+                    customer_name = st.text_input("客户名称", key="create_customer_name")
+                    group_name = st.text_input("小组", key="create_customer_group")
+                    assigned_staff_username = st.selectbox(
+                        "负责人",
+                        staff_usernames,
+                        key="create_customer_staff",
+                    )
+                    submitted = st.form_submit_button("创建客户", type="primary", use_container_width=True)
+                if submitted:
+                    try:
+                        create_customer(
+                            customer_id,
+                            customer_name,
+                            customer_code,
+                            group_name,
+                            assigned_staff_username,
+                        )
+                        st.success(f"已创建客户 {customer_id.strip()}。")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+
+        with edit_customer_tab:
+            if not customers:
+                st.info("当前没有客户。")
+            elif not staff_usernames:
+                st.warning("请先创建 staff 账号。")
+            else:
+                customer_ids = [c["customer_id"] for c in customers]
+                selected_customer = st.selectbox("选择客户", customer_ids, key="edit_customer_select")
+                customer = next(c for c in customers if c["customer_id"] == selected_customer)
+                default_staff_index = (
+                    staff_usernames.index(customer["assigned_staff_username"])
+                    if customer["assigned_staff_username"] in staff_usernames
+                    else 0
+                )
+                with st.form("update_customer_form"):
+                    st.text_input("客户 ID", value=customer["customer_id"], disabled=True)
+                    customer_code = st.text_input(
+                        "客户代码",
+                        value=customer["customer_code"],
+                        key="edit_customer_code",
+                    )
+                    customer_name = st.text_input(
+                        "客户名称",
+                        value=customer["customer_name"],
+                        key="edit_customer_name",
+                    )
+                    group_name = st.text_input(
+                        "小组",
+                        value=customer["group_name"],
+                        key="edit_customer_group",
+                    )
+                    assigned_staff_username = st.selectbox(
+                        "负责人",
+                        staff_usernames,
+                        index=default_staff_index,
+                        key="edit_customer_staff",
+                    )
+                    submitted = st.form_submit_button("保存客户修改", type="primary", use_container_width=True)
+                if submitted:
+                    try:
+                        update_customer(
+                            selected_customer,
+                            customer_name,
+                            customer_code,
+                            group_name,
+                            assigned_staff_username,
+                        )
+                        st.success(f"已更新客户 {selected_customer}。")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))

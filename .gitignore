@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.pyc
+*.db
 
 # OS
 .DS_Store
