@@ -20,6 +20,7 @@ from PIL import Image, ImageDraw, ImageFont
 DEFAULT_FONT     = Path(__file__).parent / "font.ttf"
 DEFAULT_GLOSSARY = Path(__file__).parent / "glossary.xlsx"
 DB_PATH          = Path(__file__).parent / "pdf_project.db"
+ANTHROPIC_MODEL  = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 
 
 # ── Local user/customer/glossary access control ────────────────────────────────
@@ -1155,7 +1156,7 @@ def translate_batch(client: anthropic.Anthropic, texts: list[str], glossary: dic
     )
 
     msg = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=ANTHROPIC_MODEL,
         max_tokens=4096,
         temperature=0,
         system=_GARMENT_SYSTEM_PROMPT,
@@ -1255,7 +1256,7 @@ def _force_translate(client: anthropic.Anthropic, text: str, glossary: dict) -> 
         "只返回中文翻译结果本身，不要输出 JSON、不要解释。"
     )
     msg = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=ANTHROPIC_MODEL,
         max_tokens=512,
         system=_GARMENT_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
@@ -1343,20 +1344,21 @@ def run_pdf_translation(
             try:
                 mapping, unrecorded_batch = translate_batch(client, texts, glossary)
                 all_unrecorded |= unrecorded_batch
-            except Exception:
-                mapping = {}
+            except Exception as exc:
+                raise RuntimeError(f"批量翻译 API 调用失败：{exc}") from exc
 
             for sp in batch:
                 translated = mapping.get(sp["clean_text"], "")
                 if _needs_retranslation(sp["clean_text"], translated):
                     try:
                         translated = _force_translate(client, sp["clean_text"], glossary)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"文本重试翻译失败：{sp['clean_text'][:80]}；错误：{exc}"
+                        ) from exc
 
-                # 渲染兜底：无论翻译是否成功，绝不能让该文本框因译文为空而被空白遮盖/丢失
                 if not translated.strip():
-                    translated = sp["text"]
+                    raise RuntimeError(f"翻译结果为空：{sp['clean_text'][:80]}")
 
                 results.append({**sp, "translated": translated})
                 done += 1
@@ -1427,7 +1429,7 @@ def translate_cell_text(client: anthropic.Anthropic, text: str, glossary: dict) 
         "5. 只返回翻译结果，不要任何解释或多余文字。"
     )
     msg = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=ANTHROPIC_MODEL,
         max_tokens=512,
         system=_GARMENT_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
@@ -1588,7 +1590,7 @@ def _vision_extract_items(
 
     try:
         resp = client.messages.create(
-            model="claude-sonnet-4-6",
+            model=ANTHROPIC_MODEL,
             max_tokens=2048,
             system=_GARMENT_SYSTEM_PROMPT,
             messages=[{

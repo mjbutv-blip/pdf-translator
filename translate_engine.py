@@ -20,6 +20,7 @@ st.set_page_config(
 DEFAULT_FONT     = Path(__file__).parent / "font.ttf"
 SPREADSHEET_NAME = "Shared_Glossary"
 PRESET_USERS     = ["User_A", "User_B", "User_C", "User_D", "User_E"]
+ANTHROPIC_MODEL  = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -81,7 +82,7 @@ def _translate_block(client, text: str, glossary: dict) -> dict:
         '格式：{"translated_text": "中文结果", "unrecorded_terms": ["term1"]}'
     )
     msg = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=ANTHROPIC_MODEL,
         max_tokens=2048,
         system=(
             "你是专业服装行业翻译。处理的文本通常是工艺单表格中的一整行，"
