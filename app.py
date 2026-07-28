@@ -20,7 +20,7 @@ from PIL import Image, ImageDraw, ImageFont
 DEFAULT_FONT     = Path(__file__).parent / "font.ttf"
 DEFAULT_GLOSSARY = Path(__file__).parent / "glossary.xlsx"
 DB_PATH          = Path(__file__).parent / "pdf_project.db"
-ANTHROPIC_MODEL  = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+ANTHROPIC_MODEL  = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 
 # ── Local user/customer/glossary access control ────────────────────────────────

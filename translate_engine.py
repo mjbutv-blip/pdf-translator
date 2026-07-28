@@ -20,7 +20,7 @@ st.set_page_config(
 DEFAULT_FONT     = Path(__file__).parent / "font.ttf"
 SPREADSHEET_NAME = "Shared_Glossary"
 PRESET_USERS     = ["User_A", "User_B", "User_C", "User_D", "User_E"]
-ANTHROPIC_MODEL  = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+ANTHROPIC_MODEL  = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
