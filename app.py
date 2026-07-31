@@ -59,7 +59,9 @@ def init_db() -> None:
                 customer_name TEXT NOT NULL,
                 customer_code TEXT NOT NULL UNIQUE,
                 group_name TEXT NOT NULL,
-                assigned_staff_username TEXT NOT NULL
+                assigned_staff_username TEXT NOT NULL,
+                note TEXT DEFAULT '',
+                created_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS glossary_terms (
@@ -94,6 +96,22 @@ def init_db() -> None:
             );
             """
         )
+        existing_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(customers)").fetchall()
+        }
+        if "note" not in existing_cols:
+            try:
+                conn.execute("ALTER TABLE customers ADD COLUMN note TEXT DEFAULT ''")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+        if "created_at" not in existing_cols:
+            try:
+                conn.execute("ALTER TABLE customers ADD COLUMN created_at TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
 
 
 def seed_demo_data_if_empty() -> None:
@@ -198,12 +216,41 @@ def list_customers() -> list[dict]:
     with get_db_connection() as conn:
         rows = conn.execute(
             """
-            SELECT customer_id, customer_name, customer_code, group_name, assigned_staff_username
+            SELECT customer_id, customer_name, customer_code, group_name,
+                   assigned_staff_username, note, created_at
             FROM customers
             ORDER BY customer_code
             """
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def list_customers_with_term_counts(user: dict) -> list[dict]:
+    customers = get_accessible_customers(user)
+    if not customers:
+        return []
+    customer_ids = [c["customer_id"] for c in customers]
+    placeholders = ",".join("?" for _ in customer_ids)
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT customer_id, COUNT(*) AS term_count
+            FROM glossary_terms
+            WHERE status = 'active' AND customer_id IN ({placeholders})
+            GROUP BY customer_id
+            """,
+            customer_ids,
+        ).fetchall()
+    counts = {r["customer_id"]: r["term_count"] for r in rows}
+    return [{**c, "term_count": counts.get(c["customer_id"], 0)} for c in customers]
+
+
+def get_staff_usernames() -> list[str]:
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT username FROM users WHERE role = 'staff' ORDER BY username"
+        ).fetchall()
+    return [r["username"] for r in rows]
 
 
 def sync_staff_customer_assignments() -> None:
@@ -306,6 +353,71 @@ def create_customer(
             tuple(values),
         )
     sync_staff_customer_assignments()
+
+
+def create_customer_auto_id(
+    customer_name: str,
+    customer_code: str,
+    group_name: str,
+    assigned_staff_username: str,
+    note: str = "",
+) -> str:
+    customer_name = customer_name.strip()
+    customer_code = customer_code.strip()
+    group_name = group_name.strip()
+    assigned_staff_username = assigned_staff_username.strip()
+    note = note.strip()
+    if not customer_name:
+        raise ValueError("客户名称不能为空")
+    if not customer_code:
+        raise ValueError("客户代码不能为空")
+    if not group_name:
+        raise ValueError("所属小组不能为空")
+    if not assigned_staff_username:
+        raise ValueError("负责人不能为空")
+
+    with get_db_connection() as conn:
+        staff = conn.execute(
+            "SELECT 1 FROM users WHERE username = ? AND role = 'staff'",
+            (assigned_staff_username,),
+        ).fetchone()
+        if staff is None:
+            raise ValueError("负责人必须是已有 staff 用户")
+        duplicate = conn.execute(
+            "SELECT 1 FROM customers WHERE lower(customer_code) = lower(?)",
+            (customer_code,),
+        ).fetchone()
+        if duplicate:
+            raise ValueError("客户代码已存在，不能重复创建")
+
+        customer_id = customer_code
+        id_duplicate = conn.execute(
+            "SELECT 1 FROM customers WHERE customer_id = ?",
+            (customer_id,),
+        ).fetchone()
+        if id_duplicate:
+            raise ValueError("客户 ID 已存在，请更换客户代码")
+
+        conn.execute(
+            """
+            INSERT INTO customers (
+                customer_id, customer_name, customer_code, group_name,
+                assigned_staff_username, note, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                customer_id,
+                customer_name,
+                customer_code,
+                group_name,
+                assigned_staff_username,
+                note,
+                _now_iso(),
+            ),
+        )
+    sync_staff_customer_assignments()
+    return customer_id
 
 
 def update_customer(
@@ -479,6 +591,143 @@ def create_glossary_change_request(
             ),
         )
         return int(cur.lastrowid)
+
+
+def import_customer_glossary(
+    user: dict,
+    customer_id: str,
+    glossary_df: pd.DataFrame,
+    conflict_mode: str,
+) -> tuple[dict, list[dict]]:
+    """Import parsed glossary rows for one customer.
+    conflict_mode: skip_existing, overwrite_existing, pending_request.
+    Non-admin users are forced through pending_request.
+    """
+    if not can_submit_glossary_change(user, customer_id):
+        raise PermissionError("当前用户无权为该客户上传术语库")
+    if conflict_mode not in {"skip_existing", "overwrite_existing", "pending_request"}:
+        raise ValueError("不支持的导入方式")
+    if not can_approve_glossary_change(user):
+        conflict_mode = "pending_request"
+
+    stats = {
+        "success_imported": 0,
+        "skipped_existing": 0,
+        "overwritten": 0,
+        "pending_count": 0,
+        "error_rows": 0,
+    }
+    report_rows: list[dict] = []
+    now = _now_iso()
+
+    with get_db_connection() as conn:
+        existing_rows = conn.execute(
+            """
+            SELECT glossary_id, english_term, chinese_translation, note
+            FROM glossary_terms
+            WHERE customer_id = ? AND status = 'active'
+            """,
+            (customer_id,),
+        ).fetchall()
+        existing = {r["english_term"].strip().lower(): dict(r) for r in existing_rows}
+
+        for idx, row in glossary_df.iterrows():
+            en = str(row.get(_GLOSSARY_EN_COL, "")).strip()
+            zh = str(row.get(_GLOSSARY_ZH_COL, "")).strip()
+            note = str(row.get(_GLOSSARY_NOTE_COL, "") or "").strip()
+            category = str(row.get(_GLOSSARY_CAT_COL, "") or "").strip()
+            if category:
+                note = f"{note}｜来源：{category}" if note else f"来源：{category}"
+            if not en or not zh:
+                stats["error_rows"] += 1
+                report_rows.append({
+                    "sheet_name": category,
+                    "row_number": idx + 2,
+                    "english_term": en,
+                    "chinese_translation": zh,
+                    "status": "error",
+                    "reason": "英文术语或中文翻译为空",
+                })
+                continue
+
+            key = en.lower()
+            old = existing.get(key)
+            if conflict_mode == "skip_existing" and old:
+                stats["skipped_existing"] += 1
+                report_rows.append({
+                    "sheet_name": category,
+                    "row_number": idx + 2,
+                    "english_term": en,
+                    "chinese_translation": zh,
+                    "status": "skipped_existing",
+                    "reason": "该客户已存在相同英文术语",
+                })
+                continue
+
+            if conflict_mode == "pending_request":
+                req_id = create_glossary_change_request(
+                    user,
+                    customer_id,
+                    "update" if old else "add",
+                    english_term_old=old["english_term"] if old else "",
+                    chinese_translation_old=old["chinese_translation"] if old else "",
+                    english_term_new=en,
+                    chinese_translation_new=zh,
+                    note=note,
+                )
+                stats["pending_count"] += 1
+                report_rows.append({
+                    "sheet_name": category,
+                    "row_number": idx + 2,
+                    "english_term": en,
+                    "chinese_translation": zh,
+                    "status": "pending",
+                    "reason": f"已生成待审批申请 #{req_id}",
+                })
+                continue
+
+            if old:
+                conn.execute(
+                    """
+                    UPDATE glossary_terms
+                    SET english_term = ?, chinese_translation = ?, note = ?,
+                        updated_by = ?, updated_at = ?, status = 'active'
+                    WHERE glossary_id = ?
+                    """,
+                    (en, zh, note, user["username"], now, old["glossary_id"]),
+                )
+                stats["overwritten"] += 1
+                report_rows.append({
+                    "sheet_name": category,
+                    "row_number": idx + 2,
+                    "english_term": en,
+                    "chinese_translation": zh,
+                    "status": "overwritten",
+                    "reason": "已覆盖已有术语",
+                })
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO glossary_terms (
+                        customer_id, english_term, chinese_translation, note,
+                        created_by, updated_by, updated_at, status
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
+                    """,
+                    (customer_id, en, zh, note, user["username"], user["username"], now),
+                )
+                stats["success_imported"] += 1
+                report_rows.append({
+                    "sheet_name": category,
+                    "row_number": idx + 2,
+                    "english_term": en,
+                    "chinese_translation": zh,
+                    "status": "imported",
+                    "reason": "已导入 active 术语库",
+                })
+                existing[key] = {"english_term": en, "chinese_translation": zh, "note": note}
+
+    return stats, report_rows
 
 
 def list_glossary_change_requests(
@@ -807,6 +1056,153 @@ def parse_glossary_excel(data: bytes) -> tuple[pd.DataFrame | None, list[str]]:
         for row in rows[1:]
     ]
     return pd.DataFrame(records, columns=_GLOSSARY_EDIT_COLS), []
+
+
+_EN_HEADER_ALIASES = {"english", "english_term", "英文", "英文术语", "原文"}
+_ZH_HEADER_ALIASES = {"chinese", "chinese_translation", "中文", "中文翻译", "译文"}
+_NOTE_HEADER_ALIASES = {"note", "备注", "comment", "comments", "remark", "remarks"}
+
+
+def _normalize_header(value) -> str:
+    return str(value).strip().lower().replace(" ", "_") if value is not None else ""
+
+
+def _find_glossary_header(rows: list[tuple]) -> tuple[int | None, int | None, int | None, int | None]:
+    for row_idx, row in enumerate(rows[:30]):
+        normalized = [_normalize_header(v) for v in row]
+        en_idx = zh_idx = note_idx = None
+        for col_idx, h in enumerate(normalized):
+            raw = str(row[col_idx]).strip() if row[col_idx] is not None else ""
+            if en_idx is None and (h in _EN_HEADER_ALIASES or raw in _EN_HEADER_ALIASES):
+                en_idx = col_idx
+            if zh_idx is None and (h in _ZH_HEADER_ALIASES or raw in _ZH_HEADER_ALIASES):
+                zh_idx = col_idx
+            if note_idx is None and (h in _NOTE_HEADER_ALIASES or raw in _NOTE_HEADER_ALIASES):
+                note_idx = col_idx
+        if en_idx is not None and zh_idx is not None:
+            return row_idx, en_idx, zh_idx, note_idx
+    return None, None, None, None
+
+
+def parse_customer_glossary_excel(data: bytes) -> tuple[pd.DataFrame | None, list[str], dict, list[dict]]:
+    """Parse a customer glossary upload across all sheets.
+    Supports common Chinese/English headers and returns a cleaned,
+    case-insensitively de-duplicated dataframe plus import diagnostics.
+    """
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    except Exception:
+        return None, ["无法解析该文件，请确认上传的是有效的 Excel (.xlsx) 文件"], {}, []
+
+    records: list[dict] = []
+    report_rows: list[dict] = []
+    stats = {
+        "total_rows": 0,
+        "valid_rows": 0,
+        "skipped_blank": 0,
+        "duplicate_terms": 0,
+        "error_rows": 0,
+        "sheets_without_header": 0,
+    }
+
+    for ws in wb.worksheets:
+        rows = list(ws.iter_rows(values_only=True))
+        header_idx, en_idx, zh_idx, note_idx = _find_glossary_header(rows)
+        if header_idx is None:
+            stats["sheets_without_header"] += 1
+            report_rows.append({
+                "sheet_name": ws.title,
+                "row_number": "",
+                "english_term": "",
+                "chinese_translation": "",
+                "status": "error",
+                "reason": "找不到英文/中文表头",
+            })
+            continue
+
+        for row_number, row in enumerate(rows[header_idx + 1:], start=header_idx + 2):
+            stats["total_rows"] += 1
+
+            def cell(idx: int | None) -> str:
+                if idx is None or idx >= len(row) or row[idx] is None:
+                    return ""
+                return str(row[idx]).strip()
+
+            en = cell(en_idx)
+            zh = cell(zh_idx)
+            note = cell(note_idx)
+            if not en and not zh:
+                stats["skipped_blank"] += 1
+                continue
+            if not en or not zh:
+                stats["error_rows"] += 1
+                report_rows.append({
+                    "sheet_name": ws.title,
+                    "row_number": row_number,
+                    "english_term": en,
+                    "chinese_translation": zh,
+                    "status": "error",
+                    "reason": "英文术语或中文翻译为空",
+                })
+                continue
+            records.append({
+                _GLOSSARY_EN_COL: en,
+                _GLOSSARY_ZH_COL: zh,
+                _GLOSSARY_NOTE_COL: note,
+                _GLOSSARY_CAT_COL: ws.title,
+                "_sheet_name": ws.title,
+                "_row_number": row_number,
+            })
+            stats["valid_rows"] += 1
+
+    if not records:
+        return None, ["没有找到可导入的有效术语行"], stats, report_rows
+
+    deduped: dict[str, dict] = {}
+    for r in records:
+        key = r[_GLOSSARY_EN_COL].lower()
+        if key in deduped:
+            stats["duplicate_terms"] += 1
+            report_rows.append({
+                "sheet_name": r["_sheet_name"],
+                "row_number": r["_row_number"],
+                "english_term": r[_GLOSSARY_EN_COL],
+                "chinese_translation": r[_GLOSSARY_ZH_COL],
+                "status": "duplicate_in_file",
+                "reason": "同一文件内英文术语重复，采用后出现的记录",
+            })
+        deduped[key] = r
+
+    df = pd.DataFrame(
+        [
+            {
+                _GLOSSARY_EN_COL: r[_GLOSSARY_EN_COL],
+                _GLOSSARY_ZH_COL: r[_GLOSSARY_ZH_COL],
+                _GLOSSARY_NOTE_COL: r[_GLOSSARY_NOTE_COL],
+                _GLOSSARY_CAT_COL: r[_GLOSSARY_CAT_COL],
+            }
+            for r in deduped.values()
+        ],
+        columns=_GLOSSARY_EDIT_COLS,
+    )
+    return df, [], stats, report_rows
+
+
+def build_import_report_xlsx(report_rows: list[dict]) -> bytes:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "导入报告"
+    headers = ["sheet_name", "row_number", "english_term", "chinese_translation", "status", "reason"]
+    ws.append(headers)
+    for c in ws[1]:
+        c.font = openpyxl.styles.Font(bold=True)
+    for r in report_rows:
+        ws.append([r.get(h, "") for h in headers])
+    for col_letter, width in zip("ABCDEF", [24, 12, 34, 34, 18, 42]):
+        ws.column_dimensions[col_letter].width = width
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 def clean_glossary_df(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, int]:
@@ -2296,6 +2692,119 @@ def _build_excel_report_bytes(report_rows: list[dict], img_report_rows: list[dic
     return buf.getvalue()
 
 
+def render_customer_glossary_import_panel(
+    user: dict,
+    customer_id: str | None,
+    key_prefix: str,
+) -> None:
+    st.subheader("上传/更新客户术语库")
+    if not customer_id:
+        st.info("请先选择客户。")
+        return
+    if not can_submit_glossary_change(user, customer_id):
+        st.warning("当前用户无权为该客户上传术语库。")
+        return
+
+    mode_labels = {
+        "skip_existing": "跳过已存在术语",
+        "overwrite_existing": "覆盖已有术语",
+        "pending_request": "生成待审批申请",
+    }
+    if can_approve_glossary_change(user):
+        conflict_mode = st.radio(
+            "遇到同一客户下已存在的英文术语时",
+            ["skip_existing", "overwrite_existing", "pending_request"],
+            format_func=lambda v: mode_labels[v],
+            horizontal=True,
+            key=f"{key_prefix}_conflict_mode",
+        )
+    else:
+        conflict_mode = "pending_request"
+        st.caption("当前角色上传后会生成 pending 术语申请，等待公司管理员审批。")
+
+    uploaded = st.file_uploader(
+        "上传术语库 Excel",
+        type=["xlsx"],
+        key=f"{key_prefix}_glossary_upload",
+    )
+    if not uploaded:
+        return
+
+    df, missing, parse_stats, parse_report = parse_customer_glossary_excel(uploaded.getvalue())
+    if missing:
+        st.error("；".join(missing))
+        if parse_report:
+            st.download_button(
+                "⬇️ 下载导入错误报告",
+                data=build_import_report_xlsx(parse_report),
+                file_name="import_report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"{key_prefix}_parse_report_dl",
+            )
+        return
+
+    st.caption(
+        f"读取行数 **{parse_stats.get('total_rows', 0)}** ｜ "
+        f"有效行 **{parse_stats.get('valid_rows', 0)}** ｜ "
+        f"跳过空行 **{parse_stats.get('skipped_blank', 0)}** ｜ "
+        f"文件内重复 **{parse_stats.get('duplicate_terms', 0)}** ｜ "
+        f"错误行 **{parse_stats.get('error_rows', 0)}**"
+    )
+    st.dataframe(df.head(30), use_container_width=True, hide_index=True, height=220)
+
+    if st.button(
+        "导入为该客户术语库",
+        type="primary",
+        use_container_width=True,
+        key=f"{key_prefix}_import_btn",
+    ):
+        try:
+            import_stats, import_report = import_customer_glossary(
+                user,
+                customer_id,
+                df,
+                conflict_mode,
+            )
+            combined_report = parse_report + import_report
+            combined_stats = {
+                **parse_stats,
+                **import_stats,
+                "error_rows": parse_stats.get("error_rows", 0) + import_stats.get("error_rows", 0),
+            }
+            st.session_state[f"{key_prefix}_last_import_report"] = combined_report
+            st.session_state[f"{key_prefix}_last_import_stats"] = combined_stats
+            st.success(
+                f"导入完成：新增 active **{import_stats['success_imported']}** 条，"
+                f"覆盖 **{import_stats['overwritten']}** 条，"
+                f"跳过已有 **{import_stats['skipped_existing']}** 条，"
+                f"待审批 **{import_stats['pending_count']}** 条。"
+            )
+        except Exception as exc:
+            st.error(str(exc))
+
+    last_report = st.session_state.get(f"{key_prefix}_last_import_report")
+    last_stats = st.session_state.get(f"{key_prefix}_last_import_stats")
+    if last_report and last_stats:
+        st.caption(
+            f"最近一次导入报告：总行数 {last_stats.get('total_rows', 0)}，"
+            f"成功导入 {last_stats.get('success_imported', 0)}，"
+            f"跳过空行 {last_stats.get('skipped_blank', 0)}，"
+            f"重复术语 {last_stats.get('duplicate_terms', 0)}，"
+            f"覆盖术语 {last_stats.get('overwritten', 0)}，"
+            f"待审批 {last_stats.get('pending_count', 0)}，"
+            f"错误行 {last_stats.get('error_rows', 0)}。"
+        )
+        st.download_button(
+            "⬇️ 下载 import_report.xlsx",
+            data=build_import_report_xlsx(last_report),
+            file_name="import_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key=f"{key_prefix}_import_report_dl",
+        )
+
+
 with tab_excel:
     excel_files = st.file_uploader(
         "上传待翻译 Excel（可一次选择多个文件）",
@@ -2576,6 +3085,13 @@ with tab_glossary:
                         )
                         st.success(f"已提交删除申请，申请编号 #{req_id}。等待公司管理员审批。")
 
+        st.divider()
+        render_customer_glossary_import_panel(
+            current_user,
+            selected_customer_id,
+            "selected_customer_glossary",
+        )
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Approval Tab
@@ -2760,53 +3276,108 @@ if tab_user_admin is not None:
 # ════════════════════════════════════════════════════════════════════════════
 if tab_customer_admin is not None:
     with tab_customer_admin:
-        st.caption("仅 company_admin 可见。修改负责人后会同步 staff 的 assigned_customer_ids。")
-        customers = list_customers()
-        staff_users = [u for u in list_users() if u["role"] == "staff"]
-        staff_usernames = [u["username"] for u in staff_users]
+        st.caption("仅 company_admin 可见。创建/修改负责人后会同步 staff 的 assigned_customer_ids。")
+        customers = list_customers_with_term_counts(current_user)
+        staff_usernames = get_staff_usernames()
         customers_df = pd.DataFrame(customers)
         if not customers_df.empty:
-            st.dataframe(
-                customers_df[[
-                    "customer_id", "customer_code", "customer_name",
-                    "group_name", "assigned_staff_username",
-                ]],
-                use_container_width=True,
-                hide_index=True,
-                height=240,
-            )
+            display_customers = customers_df[[
+                "customer_id", "customer_code", "customer_name",
+                "group_name", "assigned_staff_username", "term_count",
+                "created_at", "note",
+            ]].rename(columns={
+                "customer_id": "客户ID",
+                "customer_code": "客户代码",
+                "customer_name": "客户名称",
+                "group_name": "所属小组",
+                "assigned_staff_username": "负责职员",
+                "term_count": "当前术语数量",
+                "created_at": "创建时间",
+                "note": "备注",
+            })
+            st.dataframe(display_customers, use_container_width=True, hide_index=True, height=260)
+        else:
+            st.info("当前没有客户。")
 
         st.divider()
-        add_customer_tab, edit_customer_tab = st.tabs(["新增客户", "修改客户"])
+        add_customer_tab, import_customer_tab, edit_customer_tab = st.tabs([
+            "创建新客户",
+            "上传/更新术语库",
+            "修改客户",
+        ])
 
         with add_customer_tab:
             if not staff_usernames:
                 st.warning("请先创建 staff 账号，再新增客户。")
             else:
                 with st.form("create_customer_form"):
-                    customer_id = st.text_input("客户 ID", placeholder="例如 CUST004", key="create_customer_id")
-                    customer_code = st.text_input("客户代码", placeholder="例如 CUST004", key="create_customer_code")
                     customer_name = st.text_input("客户名称", key="create_customer_name")
+                    customer_code = st.text_input("客户代码", placeholder="例如 EL 或 CUST004", key="create_customer_code")
                     group_name = st.text_input("小组", key="create_customer_group")
                     assigned_staff_username = st.selectbox(
-                        "负责人",
+                        "负责业务员 / 普通职员",
                         staff_usernames,
                         key="create_customer_staff",
                     )
+                    note = st.text_area("备注（可选）", key="create_customer_note")
                     submitted = st.form_submit_button("创建客户", type="primary", use_container_width=True)
                 if submitted:
                     try:
-                        create_customer(
-                            customer_id,
+                        new_customer_id = create_customer_auto_id(
                             customer_name,
                             customer_code,
                             group_name,
                             assigned_staff_username,
+                            note,
                         )
-                        st.success(f"已创建客户 {customer_id.strip()}。")
+                        st.session_state["selected_customer_id"] = new_customer_id
+                        st.success(f"已创建客户 {customer_code.strip()}，可立即在 PDF / Excel 翻译中选择。")
                         st.rerun()
                     except Exception as exc:
                         st.error(str(exc))
+
+        with import_customer_tab:
+            if not customers:
+                st.info("请先创建客户。")
+            else:
+                customer_ids = [c["customer_id"] for c in customers]
+                labels = {
+                    c["customer_id"]: f"{c['customer_code']} / {c['customer_name']} / {c['group_name']}"
+                    for c in customers
+                }
+                default_customer = st.session_state.get("selected_customer_id")
+                default_index = customer_ids.index(default_customer) if default_customer in customer_ids else 0
+                import_customer_id = st.selectbox(
+                    "选择客户",
+                    customer_ids,
+                    index=default_index,
+                    format_func=lambda cid: labels.get(cid, cid),
+                    key="admin_import_customer_select",
+                )
+                selected_terms = get_customer_glossary_df(import_customer_id)
+                st.caption(f"当前 active 术语：**{len(selected_terms)}** 条")
+                dl_col, view_col = st.columns(2)
+                with dl_col:
+                    st.download_button(
+                        "⬇️ 下载该客户术语库",
+                        data=glossary_df_to_xlsx_bytes(selected_terms),
+                        file_name=f"{labels.get(import_customer_id, import_customer_id).split(' / ')[0]}_glossary.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key="admin_customer_glossary_dl",
+                    )
+                with view_col:
+                    if st.button("查看术语库", use_container_width=True, key="admin_view_customer_terms"):
+                        st.session_state["admin_show_customer_terms"] = import_customer_id
+                if st.session_state.get("admin_show_customer_terms") == import_customer_id:
+                    st.dataframe(selected_terms, use_container_width=True, hide_index=True, height=220)
+
+                st.divider()
+                render_customer_glossary_import_panel(
+                    current_user,
+                    import_customer_id,
+                    "admin_customer_glossary",
+                )
 
         with edit_customer_tab:
             if not customers:
@@ -2845,6 +3416,11 @@ if tab_customer_admin is not None:
                         index=default_staff_index,
                         key="edit_customer_staff",
                     )
+                    note = st.text_area(
+                        "备注",
+                        value=customer.get("note") or "",
+                        key="edit_customer_note",
+                    )
                     submitted = st.form_submit_button("保存客户修改", type="primary", use_container_width=True)
                 if submitted:
                     try:
@@ -2855,6 +3431,11 @@ if tab_customer_admin is not None:
                             group_name,
                             assigned_staff_username,
                         )
+                        with get_db_connection() as conn:
+                            conn.execute(
+                                "UPDATE customers SET note = ? WHERE customer_id = ?",
+                                (note.strip(), selected_customer),
+                            )
                         st.success(f"已更新客户 {selected_customer}。")
                         st.rerun()
                     except Exception as exc:
