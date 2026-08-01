@@ -69,6 +69,7 @@ def init_db() -> None:
                 customer_id TEXT NOT NULL,
                 english_term TEXT NOT NULL,
                 chinese_translation TEXT NOT NULL,
+                normalized_key TEXT DEFAULT '',
                 note TEXT DEFAULT '',
                 created_by TEXT,
                 updated_by TEXT,
@@ -105,11 +106,15 @@ def init_db() -> None:
                 cell_coordinate TEXT DEFAULT '',
                 original_term TEXT NOT NULL,
                 normalized_term TEXT NOT NULL,
+                variants TEXT DEFAULT '',
                 ai_suggested_translation TEXT DEFAULT '',
                 final_translation TEXT DEFAULT '',
                 context_sentence TEXT DEFAULT '',
                 frequency INTEGER NOT NULL DEFAULT 1,
                 confidence TEXT DEFAULT 'medium',
+                matched_by TEXT DEFAULT 'no_match',
+                matched_glossary_term TEXT DEFAULT '',
+                conflict_warning TEXT DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'selected', 'submitted', 'ignored', 'approved', 'rejected')),
                 created_by TEXT,
                 created_at TEXT,
@@ -134,6 +139,16 @@ def init_db() -> None:
             except sqlite3.OperationalError as exc:
                 if "duplicate column name" not in str(exc).lower():
                     raise
+        glossary_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(glossary_terms)").fetchall()
+        }
+        if "normalized_key" not in glossary_cols:
+            try:
+                conn.execute("ALTER TABLE glossary_terms ADD COLUMN normalized_key TEXT DEFAULT ''")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
         request_cols = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(glossary_change_requests)").fetchall()
@@ -144,6 +159,59 @@ def init_db() -> None:
             except sqlite3.OperationalError as exc:
                 if "duplicate column name" not in str(exc).lower():
                     raise
+        candidate_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(term_candidates)").fetchall()
+        }
+        if "variants" not in candidate_cols:
+            try:
+                conn.execute("ALTER TABLE term_candidates ADD COLUMN variants TEXT DEFAULT ''")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+        for col_name, col_sql in [
+            ("matched_by", "ALTER TABLE term_candidates ADD COLUMN matched_by TEXT DEFAULT 'no_match'"),
+            ("matched_glossary_term", "ALTER TABLE term_candidates ADD COLUMN matched_glossary_term TEXT DEFAULT ''"),
+            ("conflict_warning", "ALTER TABLE term_candidates ADD COLUMN conflict_warning TEXT DEFAULT ''"),
+        ]:
+            if col_name not in candidate_cols:
+                try:
+                    conn.execute(col_sql)
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc).lower():
+                        raise
+        rows = conn.execute(
+            """
+            SELECT glossary_id, english_term
+            FROM glossary_terms
+            WHERE COALESCE(normalized_key, '') = ''
+            """
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                """
+                UPDATE glossary_terms
+                SET normalized_key = ?
+                WHERE glossary_id = ?
+                """,
+                (normalize_term_key(row["english_term"]), row["glossary_id"]),
+            )
+        rows = conn.execute(
+            """
+            SELECT candidate_id, original_term
+            FROM term_candidates
+            WHERE COALESCE(variants, '') = ''
+            """
+        ).fetchall()
+        for row in rows:
+            conn.execute(
+                """
+                UPDATE term_candidates
+                SET variants = ?
+                WHERE candidate_id = ?
+                """,
+                (json.dumps([row["original_term"]], ensure_ascii=False), row["candidate_id"]),
+            )
 
 
 def seed_demo_data_if_empty() -> None:
@@ -199,10 +267,14 @@ def seed_demo_data_if_empty() -> None:
         conn.executemany(
             """
             INSERT INTO glossary_terms
-                (customer_id, english_term, chinese_translation, note, created_by, updated_by, updated_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
+                (customer_id, english_term, chinese_translation, normalized_key, note,
+                 created_by, updated_by, updated_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')
             """,
-            [(cid, en, zh, note, by, by, _now_iso()) for cid, en, zh, note, by in terms],
+            [
+                (cid, en, zh, normalize_term_key(en), note, by, by, _now_iso())
+                for cid, en, zh, note, by in terms
+            ],
         )
 
 
@@ -527,7 +599,7 @@ def get_customer_glossary_df(customer_id: str) -> pd.DataFrame:
     with get_db_connection() as conn:
         rows = conn.execute(
             """
-            SELECT english_term, chinese_translation, note
+            SELECT english_term, chinese_translation, note, normalized_key
             FROM glossary_terms
             WHERE customer_id = ? AND status = 'active'
             ORDER BY lower(english_term)
@@ -559,7 +631,7 @@ def get_active_glossary_terms(customer_id: str) -> list[dict]:
         rows = conn.execute(
             """
             SELECT glossary_id, customer_id, english_term, chinese_translation, note,
-                   created_by, updated_by, updated_at, status
+                   normalized_key, created_by, updated_by, updated_at, status
             FROM glossary_terms
             WHERE customer_id = ? AND status = 'active'
             ORDER BY lower(english_term)
@@ -590,16 +662,74 @@ _TERM_STOPWORDS = {
     "option", "season", "style", "supplier", "owner", "collection", "division",
     "description", "comments", "instructions", "page", "date", "plan", "type",
 }
+_KEY_STOPWORDS = {"of", "the", "a", "an", "for", "to"}
+_AMBIGUOUS_DIRECTION_WORDS = {
+    "front", "back", "left", "right", "upper", "lower", "inner", "outer",
+    "inside", "outside", "top", "bottom",
+}
 _BRAND_LIKE_TERMS = {"cotton juice", "cotton juice baby", "uneco", "marca"}
 _RE_DATE_LIKE = re.compile(r"^(?:\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?|\d{4}[./-]\d{1,2}[./-]\d{1,2})$")
 _RE_STYLE_LIKE = re.compile(r"^[A-Z]{1,4}\d{3,}[A-Z0-9\-/ ]*$")
 _RE_PANTONE_LIKE = re.compile(r"^(?:pantone\s*)?\d{2,4}\s*[A-Z]?$", re.IGNORECASE)
-_RE_FILE_PATH_LIKE = re.compile(r"[/\\]|\.pdf$|\.xlsx?$", re.IGNORECASE)
+_RE_FILE_PATH_LIKE = re.compile(r"(^/|[A-Za-z]:\\|[/\\][^/\\]+\.(?:pdf|xlsx?)$|\.(?:pdf|xlsx?)$)", re.IGNORECASE)
 _RE_TERM_TOKEN = re.compile(r"[A-Za-z][A-Za-z&'’.\-]*")
 
 
 def normalize_term(term: str) -> str:
     return re.sub(r"\s+", " ", str(term or "").strip()).lower()
+
+
+def normalize_term_key(text: str) -> str:
+    t = str(text or "").strip().lower()
+    t = re.sub(r"[-_/,.:;()]+", " ", t)
+    t = re.sub(r"\s+", " ", t)
+    words = [w for w in re.findall(r"[a-z]+", t) if w not in _KEY_STOPWORDS]
+    if len(words) == 1:
+        return words[0]
+    if not 2 <= len(words) <= 4:
+        return ""
+    return "|".join(sorted(words))
+
+
+def normalized_key_low_confidence(text: str) -> bool:
+    words = set(re.findall(r"[a-z]+", str(text or "").lower()))
+    return bool(words & _AMBIGUOUS_DIRECTION_WORDS)
+
+
+def glossary_conflicts_by_key(customer_id: str, normalized_key: str) -> list[dict]:
+    if not normalized_key:
+        return []
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT glossary_id, english_term, chinese_translation
+            FROM glossary_terms
+            WHERE customer_id = ? AND normalized_key = ? AND status = 'active'
+            ORDER BY glossary_id
+            """,
+            (customer_id, normalized_key),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def glossary_key_has_translation_conflict(rows: list[dict], new_translation: str = "") -> bool:
+    translations = {
+        normalize_term(r.get("chinese_translation", ""))
+        for r in rows
+        if normalize_term(r.get("chinese_translation", ""))
+    }
+    if new_translation:
+        translations.add(normalize_term(new_translation))
+    return len(translations) > 1
+
+
+def glossary_conflict_keys_from_dict(glossary: dict) -> set[str]:
+    grouped: dict[str, set[str]] = {}
+    for en, zh in glossary.items():
+        key = normalize_term_key(en)
+        if key:
+            grouped.setdefault(key, set()).add(normalize_term(zh))
+    return {key for key, translations in grouped.items() if len(translations) > 1}
 
 
 def is_noise_term(term: str) -> bool:
@@ -635,7 +765,20 @@ def extract_candidate_terms_from_text(text: str, glossary: dict) -> list[str]:
     cleaned = _clean_extracted_text(text)
     if not cleaned:
         return []
-    active_keys = {normalize_term(k) for k in glossary}
+    conflict_keys = glossary_conflict_keys_from_dict(glossary)
+    conflict_terms_by_key: dict[str, str] = {}
+    for en in glossary:
+        k = normalize_term_key(en)
+        if k in conflict_keys:
+            conflict_terms_by_key.setdefault(k, "")
+            conflict_terms_by_key[k] = (
+                f"{conflict_terms_by_key[k]}; {en}" if conflict_terms_by_key[k] else en
+            )
+    active_keys = {
+        normalize_term_key(k) or normalize_term(k)
+        for k in glossary
+        if (normalize_term_key(k) or normalize_term(k)) not in conflict_keys
+    }
     terms: list[str] = []
 
     # Split on separators commonly used in tech packs, then keep compact phrases.
@@ -650,7 +793,7 @@ def extract_candidate_terms_from_text(text: str, glossary: dict) -> list[str]:
         for n in range(min(4, len(words)), 0, -1):
             for i in range(0, len(words) - n + 1):
                 cand = " ".join(words[i:i + n]).strip()
-                key = normalize_term(cand)
+                key = normalize_term_key(cand) or normalize_term(cand)
                 if key in active_keys or is_noise_term(cand):
                     continue
                 if n == 1 and len(cand) < 4:
@@ -717,7 +860,7 @@ def suggest_term_candidate_translations(
         term = str(item.get("term", "")).strip()
         if not term:
             continue
-        out[normalize_term(term)] = {
+        out[normalize_term_key(term) or normalize_term(term)] = {
             "translation": str(item.get("translation", "")).strip(),
             "confidence": str(item.get("confidence", "medium")).strip() or "medium",
         }
@@ -734,7 +877,11 @@ def _pending_term_keys(customer_id: str) -> set[str]:
             """,
             (customer_id,),
         ).fetchall()
-    return {normalize_term(r["english_term_new"]) for r in rows if r["english_term_new"]}
+    return {
+        normalize_term_key(r["english_term_new"]) or normalize_term(r["english_term_new"])
+        for r in rows
+        if r["english_term_new"]
+    }
 
 
 def save_term_candidates(
@@ -748,23 +895,39 @@ def save_term_candidates(
 ) -> int:
     if not customer_id or not candidate_contexts:
         return 0
-    active_keys = {normalize_term(k) for k in glossary}
+    conflict_keys = glossary_conflict_keys_from_dict(glossary)
+    conflict_terms_by_key: dict[str, str] = {}
+    for en in glossary:
+        k = normalize_term_key(en)
+        if k in conflict_keys:
+            conflict_terms_by_key.setdefault(k, "")
+            conflict_terms_by_key[k] = (
+                f"{conflict_terms_by_key[k]}; {en}" if conflict_terms_by_key[k] else en
+            )
+    active_keys = {
+        normalize_term_key(k) or normalize_term(k)
+        for k in glossary
+        if (normalize_term_key(k) or normalize_term(k)) not in conflict_keys
+    }
     pending_keys = _pending_term_keys(customer_id)
     merged: dict[str, dict] = {}
     for item in candidate_contexts:
         term = str(item.get("term", "")).strip()
-        key = normalize_term(term)
+        key = normalize_term_key(term) or normalize_term(term)
         if not key or key in active_keys or key in pending_keys or is_noise_term(term):
             continue
         if key not in merged:
             merged[key] = {
                 "term": term,
+                "variants": [],
                 "context": str(item.get("context", "")).strip(),
                 "page_or_sheet": str(item.get("page_or_sheet", "")).strip(),
                 "cell_coordinate": str(item.get("cell_coordinate", "")).strip(),
                 "frequency": 0,
                 "source_type": source_type,
             }
+        if term not in merged[key]["variants"]:
+            merged[key]["variants"].append(term)
         merged[key]["frequency"] += int(item.get("frequency", 1) or 1)
         if item.get("context") and len(str(item["context"])) > len(merged[key]["context"]):
             merged[key]["context"] = str(item["context"]).strip()
@@ -787,9 +950,11 @@ def save_term_candidates(
             suggestion = suggestions.get(key, {})
             zh = suggestion.get("translation", "")
             confidence = suggestion.get("confidence", "medium")
+            if normalized_key_low_confidence(item["term"]):
+                confidence = "low"
             existing = conn.execute(
                 """
-                SELECT candidate_id, frequency
+                SELECT candidate_id, frequency, variants
                 FROM term_candidates
                 WHERE customer_id = ? AND normalized_term = ?
                   AND status IN ('draft', 'selected')
@@ -799,12 +964,23 @@ def save_term_candidates(
                 (customer_id, key),
             ).fetchone()
             if existing:
+                try:
+                    variants = json.loads(existing["variants"] or "[]")
+                except json.JSONDecodeError:
+                    variants = []
+                for v in item["variants"]:
+                    if v not in variants:
+                        variants.append(v)
                 conn.execute(
                     """
                     UPDATE term_candidates
                     SET frequency = frequency + ?, context_sentence = ?,
                         source_file_name = ?, source_type = ?, page_or_sheet = ?,
                         cell_coordinate = ?,
+                        variants = ?,
+                        matched_by = ?,
+                        matched_glossary_term = ?,
+                        conflict_warning = ?,
                         ai_suggested_translation = COALESCE(NULLIF(ai_suggested_translation, ''), ?),
                         final_translation = COALESCE(NULLIF(final_translation, ''), ?),
                         confidence = COALESCE(NULLIF(confidence, ''), ?)
@@ -817,6 +993,10 @@ def save_term_candidates(
                         source_type,
                         item["page_or_sheet"],
                         item["cell_coordinate"],
+                        json.dumps(variants, ensure_ascii=False),
+                        "normalized_key" if key in conflict_keys else "no_match",
+                        conflict_terms_by_key.get(key, ""),
+                        "normalized_key 命中多条不同中文翻译，请人工确认" if key in conflict_keys else "",
                         zh,
                         zh,
                         confidence,
@@ -828,11 +1008,12 @@ def save_term_candidates(
                     """
                     INSERT OR IGNORE INTO term_candidates (
                         customer_id, source_file_name, source_type, page_or_sheet,
-                        cell_coordinate, original_term, normalized_term,
+                        cell_coordinate, original_term, normalized_term, variants,
                         ai_suggested_translation, final_translation, context_sentence,
-                        frequency, confidence, status, created_by, created_at
+                        frequency, confidence, matched_by, matched_glossary_term,
+                        conflict_warning, status, created_by, created_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)
                     """,
                     (
                         customer_id,
@@ -842,11 +1023,15 @@ def save_term_candidates(
                         item["cell_coordinate"],
                         item["term"],
                         key,
+                        json.dumps(item["variants"], ensure_ascii=False),
                         zh,
                         zh,
                         item["context"],
                         item["frequency"],
                         confidence,
+                        "normalized_key" if key in conflict_keys else "no_match",
+                        conflict_terms_by_key.get(key, ""),
+                        "normalized_key 命中多条不同中文翻译，请人工确认" if key in conflict_keys else "",
                         created_by,
                         now,
                     ),
@@ -918,10 +1103,13 @@ def submit_term_candidates_for_approval(user: dict, edited_rows: list[dict]) -> 
                     "SELECT english_term FROM glossary_terms WHERE customer_id = ? AND status = 'active'",
                     (customer_id,),
                 ).fetchall()
-                active_keys_cache[customer_id] = {normalize_term(r["english_term"]) for r in active_rows}
+                active_keys_cache[customer_id] = {
+                    normalize_term_key(r["english_term"]) or normalize_term(r["english_term"])
+                    for r in active_rows
+                }
             if customer_id not in pending_keys_cache:
                 pending_keys_cache[customer_id] = _pending_term_keys(customer_id)
-            key = normalize_term(candidate["original_term"])
+            key = normalize_term_key(candidate["original_term"]) or normalize_term(candidate["original_term"])
             if key in active_keys_cache[customer_id]:
                 conn.execute(
                     "UPDATE term_candidates SET status = 'ignored' WHERE candidate_id = ?",
@@ -935,6 +1123,8 @@ def submit_term_candidates_for_approval(user: dict, edited_rows: list[dict]) -> 
             source_note = (
                 f"candidate_id={candidate_id}；来源文件={candidate['source_file_name']}；"
                 f"来源位置={candidate['page_or_sheet']} {candidate['cell_coordinate'] or ''}；"
+                f"normalized_key={candidate['normalized_term']}；"
+                f"variants={candidate['variants'] or candidate['original_term']}；"
                 f"出现次数={candidate['frequency']}；置信度={candidate['confidence']}；"
                 f"上下文={candidate['context_sentence']}"
             )
@@ -1034,17 +1224,23 @@ def import_customer_glossary(
     with get_db_connection() as conn:
         existing_rows = conn.execute(
             """
-            SELECT glossary_id, english_term, chinese_translation, note
+            SELECT glossary_id, english_term, chinese_translation, normalized_key, note
             FROM glossary_terms
             WHERE customer_id = ? AND status = 'active'
             """,
             (customer_id,),
         ).fetchall()
         existing = {r["english_term"].strip().lower(): dict(r) for r in existing_rows}
+        existing_by_key: dict[str, list[dict]] = {}
+        for r in existing_rows:
+            key = r["normalized_key"] or normalize_term_key(r["english_term"])
+            if key:
+                existing_by_key.setdefault(key, []).append(dict(r))
 
         for idx, row in glossary_df.iterrows():
             en = str(row.get(_GLOSSARY_EN_COL, "")).strip()
             zh = str(row.get(_GLOSSARY_ZH_COL, "")).strip()
+            normalized_key = normalize_term_key(en)
             note = str(row.get(_GLOSSARY_NOTE_COL, "") or "").strip()
             category = str(row.get(_GLOSSARY_CAT_COL, "") or "").strip()
             if category:
@@ -1063,6 +1259,18 @@ def import_customer_glossary(
 
             key = en.lower()
             old = existing.get(key)
+            key_matches = existing_by_key.get(normalized_key, []) if normalized_key else []
+            if old is None and key_matches and glossary_key_has_translation_conflict(key_matches, zh):
+                stats["error_rows"] += 1
+                report_rows.append({
+                    "sheet_name": category,
+                    "row_number": idx + 2,
+                    "english_term": en,
+                    "chinese_translation": zh,
+                    "status": "normalized_key_conflict",
+                    "reason": "同一 normalized_key 已存在不同中文翻译，请人工处理",
+                })
+                continue
             if conflict_mode == "skip_existing" and old:
                 stats["skipped_existing"] += 1
                 report_rows.append({
@@ -1101,11 +1309,11 @@ def import_customer_glossary(
                 conn.execute(
                     """
                     UPDATE glossary_terms
-                    SET english_term = ?, chinese_translation = ?, note = ?,
+                    SET english_term = ?, chinese_translation = ?, normalized_key = ?, note = ?,
                         updated_by = ?, updated_at = ?, status = 'active'
                     WHERE glossary_id = ?
                     """,
-                    (en, zh, note, user["username"], now, old["glossary_id"]),
+                    (en, zh, normalized_key, note, user["username"], now, old["glossary_id"]),
                 )
                 stats["overwritten"] += 1
                 report_rows.append({
@@ -1120,12 +1328,12 @@ def import_customer_glossary(
                 conn.execute(
                     """
                     INSERT INTO glossary_terms (
-                        customer_id, english_term, chinese_translation, note,
+                        customer_id, english_term, chinese_translation, normalized_key, note,
                         created_by, updated_by, updated_at, status
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')
                     """,
-                    (customer_id, en, zh, note, user["username"], user["username"], now),
+                    (customer_id, en, zh, normalized_key, note, user["username"], user["username"], now),
                 )
                 stats["success_imported"] += 1
                 report_rows.append({
@@ -1136,7 +1344,15 @@ def import_customer_glossary(
                     "status": "imported",
                     "reason": "已导入 active 术语库",
                 })
-                existing[key] = {"english_term": en, "chinese_translation": zh, "note": note}
+                new_existing = {
+                    "english_term": en,
+                    "chinese_translation": zh,
+                    "normalized_key": normalized_key,
+                    "note": note,
+                }
+                existing[key] = new_existing
+                if normalized_key:
+                    existing_by_key.setdefault(normalized_key, []).append(new_existing)
 
     return stats, report_rows
 
@@ -1183,6 +1399,10 @@ def _apply_approved_glossary_change(conn: sqlite3.Connection, request_row: sqlit
     now = request_row["reviewed_at"]
 
     if action == "add":
+        normalized_key = normalize_term_key(request_row["english_term_new"])
+        key_matches = glossary_conflicts_by_key(customer_id, normalized_key)
+        if glossary_key_has_translation_conflict(key_matches, request_row["chinese_translation_new"]):
+            raise ValueError("该术语 normalized_key 已存在不同中文翻译，请先处理术语冲突")
         existing = conn.execute(
             """
             SELECT glossary_id
@@ -1197,11 +1417,13 @@ def _apply_approved_glossary_change(conn: sqlite3.Connection, request_row: sqlit
             conn.execute(
                 """
                 UPDATE glossary_terms
-                SET chinese_translation = ?, note = ?, updated_by = ?, updated_at = ?, status = 'active'
+                SET chinese_translation = ?, normalized_key = ?, note = ?,
+                    updated_by = ?, updated_at = ?, status = 'active'
                 WHERE glossary_id = ?
                 """,
                 (
                     request_row["chinese_translation_new"],
+                    normalized_key,
                     request_row["note"] or "",
                     reviewer,
                     now,
@@ -1212,15 +1434,16 @@ def _apply_approved_glossary_change(conn: sqlite3.Connection, request_row: sqlit
             conn.execute(
                 """
                 INSERT INTO glossary_terms (
-                    customer_id, english_term, chinese_translation, note,
+                    customer_id, english_term, chinese_translation, normalized_key, note,
                     created_by, updated_by, updated_at, status
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')
                 """,
                 (
                     customer_id,
                     request_row["english_term_new"],
                     request_row["chinese_translation_new"],
+                    normalized_key,
                     request_row["note"] or "",
                     request_row["submitted_by"],
                     reviewer,
@@ -1228,16 +1451,24 @@ def _apply_approved_glossary_change(conn: sqlite3.Connection, request_row: sqlit
                 ),
             )
     elif action == "update":
+        normalized_key = normalize_term_key(request_row["english_term_new"])
+        key_matches = [
+            r for r in glossary_conflicts_by_key(customer_id, normalized_key)
+            if normalize_term(r["english_term"]) != normalize_term(request_row["english_term_old"])
+        ]
+        if glossary_key_has_translation_conflict(key_matches, request_row["chinese_translation_new"]):
+            raise ValueError("该术语 normalized_key 已存在不同中文翻译，请先处理术语冲突")
         conn.execute(
             """
             UPDATE glossary_terms
-            SET english_term = ?, chinese_translation = ?, note = ?,
+            SET english_term = ?, chinese_translation = ?, normalized_key = ?, note = ?,
                 updated_by = ?, updated_at = ?, status = 'active'
             WHERE customer_id = ? AND lower(english_term) = lower(?) AND status = 'active'
             """,
             (
                 request_row["english_term_new"],
                 request_row["chinese_translation_new"],
+                normalized_key,
                 request_row["note"] or "",
                 reviewer,
                 now,
@@ -1425,7 +1656,35 @@ def load_glossary(data: bytes) -> dict[str, str]:
 
 def relevant_glossary(text: str, glossary: dict) -> dict:
     tl = text.lower()
-    return {k: v for k, v in glossary.items() if k.lower() in tl}
+    normalized_map: dict[str, list[tuple[str, str]]] = {}
+    for en, zh in glossary.items():
+        key = normalize_term_key(en)
+        if key:
+            normalized_map.setdefault(key, []).append((en, zh))
+    conflict_keys = {
+        key for key, rows in normalized_map.items()
+        if len({normalize_term(zh) for _, zh in rows if normalize_term(zh)}) > 1
+    }
+    result = {
+        k: v for k, v in glossary.items()
+        if k.lower() in tl and normalize_term_key(k) not in conflict_keys
+    }
+
+    result_terms = {normalize_term(k) for k in result}
+    words = re.findall(r"[A-Za-z]+", text)
+    for n in range(2, min(4, len(words)) + 1):
+        for i in range(0, len(words) - n + 1):
+            phrase = " ".join(words[i:i + n]).strip()
+            if normalize_term(phrase) in result_terms:
+                continue
+            key = normalize_term_key(phrase)
+            if not key or key not in normalized_map:
+                continue
+            matches = normalized_map[key]
+            translations = {normalize_term(zh) for _, zh in matches if normalize_term(zh)}
+            if len(translations) == 1:
+                result[phrase] = matches[0][1]
+    return result
 
 
 # ── Glossary management (editable in-session glossary) ─────────────────────────
@@ -1597,16 +1856,20 @@ def parse_customer_glossary_excel(data: bytes) -> tuple[pd.DataFrame | None, lis
 
     deduped: dict[str, dict] = {}
     for r in records:
-        key = r[_GLOSSARY_EN_COL].lower()
+        key = normalize_term_key(r[_GLOSSARY_EN_COL]) or normalize_term(r[_GLOSSARY_EN_COL])
         if key in deduped:
             stats["duplicate_terms"] += 1
+            reason = "同一文件内 normalized_key 重复，采用后出现的记录"
+            if normalize_term(deduped[key][_GLOSSARY_ZH_COL]) != normalize_term(r[_GLOSSARY_ZH_COL]):
+                reason = "同一文件内 normalized_key 重复且中文不同，请人工确认"
+                stats["error_rows"] += 1
             report_rows.append({
                 "sheet_name": r["_sheet_name"],
                 "row_number": r["_row_number"],
                 "english_term": r[_GLOSSARY_EN_COL],
                 "chinese_translation": r[_GLOSSARY_ZH_COL],
                 "status": "duplicate_in_file",
-                "reason": "同一文件内英文术语重复，采用后出现的记录",
+                "reason": reason,
             })
         deduped[key] = r
 
@@ -3502,10 +3765,11 @@ with tab_glossary:
             st.info("当前客户还没有 active 术语。")
         else:
             display_df = terms_df[
-                ["english_term", "chinese_translation", "note", "updated_by", "updated_at"]
+                ["english_term", "chinese_translation", "normalized_key", "note", "updated_by", "updated_at"]
             ].rename(columns={
                 "english_term": "英文术语",
                 "chinese_translation": "中文翻译",
+                "normalized_key": "normalized_key",
                 "note": "备注",
                 "updated_by": "最后更新人",
                 "updated_at": "最后更新时间",
@@ -3646,13 +3910,19 @@ with tab_candidates:
         else:
             rows = []
             for c in candidates:
+                try:
+                    variants = "; ".join(json.loads(c.get("variants") or "[]"))
+                except json.JSONDecodeError:
+                    variants = c.get("variants") or c["original_term"]
                 rows.append({
                     "是否提交": False,
                     "忽略": False,
                     "candidate_id": c["candidate_id"],
                     "customer_id": c["customer_id"],
                     "客户": f"{c.get('customer_code') or c['customer_id']} / {c.get('customer_name') or ''}",
+                    "normalized_key": c["normalized_term"],
                     "英文术语": c["original_term"],
+                    "所有变体": variants or c["original_term"],
                     "AI建议中文": c["ai_suggested_translation"],
                     "人工确认中文": c["final_translation"] or c["ai_suggested_translation"],
                     "出现次数": c["frequency"],
@@ -3662,6 +3932,9 @@ with tab_candidates:
                     "单元格": c["cell_coordinate"],
                     "上下文": c["context_sentence"],
                     "置信度": c["confidence"],
+                    "matched_by": c.get("matched_by") or "no_match",
+                    "命中术语": c.get("matched_glossary_term") or "",
+                    "冲突提示": c.get("conflict_warning") or "",
                     "状态": c["status"],
                     "备注": "",
                 })
@@ -3672,9 +3945,10 @@ with tab_candidates:
                 hide_index=True,
                 height=420,
                 disabled=[
-                    "candidate_id", "customer_id", "客户", "英文术语", "AI建议中文",
+                    "candidate_id", "customer_id", "客户", "normalized_key",
+                    "英文术语", "所有变体", "AI建议中文",
                     "出现次数", "来源文件", "来源类型", "来源位置", "单元格",
-                    "上下文", "置信度", "状态",
+                    "上下文", "置信度", "matched_by", "命中术语", "冲突提示", "状态",
                 ],
                 column_config={
                     "是否提交": st.column_config.CheckboxColumn("是否提交"),
