@@ -3610,24 +3610,25 @@ with tab_candidates:
     accessible_customers = get_accessible_customers(current_user)
     if not accessible_customers:
         st.warning("当前用户没有可访问客户。")
+    elif not selected_customer_id:
+        st.info("请先在页面顶部选择客户。")
     else:
-        candidate_customer_options = ["全部"] + [c["customer_id"] for c in accessible_customers]
         candidate_customer_labels = {
             c["customer_id"]: f"{c['customer_code']} / {c['customer_name']}"
             for c in accessible_customers
         }
+        current_customer_label = candidate_customer_labels.get(selected_customer_id, selected_customer_id)
+        candidate_customer = selected_customer_id
+        show_all_candidates = False
         fc, fs = st.columns(2)
         with fc:
-            default_candidate_customer = (
-                selected_customer_id if selected_customer_id in candidate_customer_options else "全部"
-            )
-            candidate_customer = st.selectbox(
-                "客户",
-                candidate_customer_options,
-                index=candidate_customer_options.index(default_candidate_customer),
-                format_func=lambda cid: "全部" if cid == "全部" else candidate_customer_labels.get(cid, cid),
-                key="candidate_customer_filter",
-            )
+            st.caption(f"当前客户：**{current_customer_label}**")
+            if can_approve_glossary_change(current_user):
+                show_all_candidates = st.toggle(
+                    "查看全部客户候选",
+                    value=False,
+                    key="candidate_show_all_toggle",
+                )
         with fs:
             candidate_status = st.selectbox(
                 "状态",
@@ -3637,7 +3638,7 @@ with tab_candidates:
 
         candidates = list_term_candidates(
             current_user,
-            customer_id=None if candidate_customer == "全部" else candidate_customer,
+            customer_id=None if show_all_candidates else candidate_customer,
             status=candidate_status,
         )
         if not candidates:
