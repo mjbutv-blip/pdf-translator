@@ -81,6 +81,7 @@ def init_db() -> None:
                 request_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 customer_id TEXT NOT NULL,
                 action_type TEXT NOT NULL CHECK(action_type IN ('add', 'update', 'delete')),
+                candidate_id INTEGER,
                 english_term_old TEXT,
                 chinese_translation_old TEXT,
                 english_term_new TEXT,
@@ -93,6 +94,27 @@ def init_db() -> None:
                 reviewed_at TEXT,
                 review_comment TEXT,
                 FOREIGN KEY(customer_id) REFERENCES customers(customer_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS term_candidates (
+                candidate_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                customer_id TEXT NOT NULL,
+                source_file_name TEXT NOT NULL,
+                source_type TEXT NOT NULL CHECK(source_type IN ('PDF', 'Excel')),
+                page_or_sheet TEXT DEFAULT '',
+                cell_coordinate TEXT DEFAULT '',
+                original_term TEXT NOT NULL,
+                normalized_term TEXT NOT NULL,
+                ai_suggested_translation TEXT DEFAULT '',
+                final_translation TEXT DEFAULT '',
+                context_sentence TEXT DEFAULT '',
+                frequency INTEGER NOT NULL DEFAULT 1,
+                confidence TEXT DEFAULT 'medium',
+                status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'selected', 'submitted', 'ignored', 'approved', 'rejected')),
+                created_by TEXT,
+                created_at TEXT,
+                submitted_at TEXT,
+                UNIQUE(customer_id, normalized_term, status)
             );
             """
         )
@@ -109,6 +131,16 @@ def init_db() -> None:
         if "created_at" not in existing_cols:
             try:
                 conn.execute("ALTER TABLE customers ADD COLUMN created_at TEXT")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
+        request_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(glossary_change_requests)").fetchall()
+        }
+        if "candidate_id" not in request_cols:
+            try:
+                conn.execute("ALTER TABLE glossary_change_requests ADD COLUMN candidate_id INTEGER")
             except sqlite3.OperationalError as exc:
                 if "duplicate column name" not in str(exc).lower():
                     raise
@@ -552,6 +584,383 @@ def get_active_glossary_term(customer_id: str, english_term: str) -> dict | None
     return dict(row) if row else None
 
 
+_TERM_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "is",
+    "it", "of", "on", "or", "the", "to", "with", "without", "this", "that",
+    "option", "season", "style", "supplier", "owner", "collection", "division",
+    "description", "comments", "instructions", "page", "date", "plan", "type",
+}
+_BRAND_LIKE_TERMS = {"cotton juice", "cotton juice baby", "uneco", "marca"}
+_RE_DATE_LIKE = re.compile(r"^(?:\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?|\d{4}[./-]\d{1,2}[./-]\d{1,2})$")
+_RE_STYLE_LIKE = re.compile(r"^[A-Z]{1,4}\d{3,}[A-Z0-9\-/ ]*$")
+_RE_PANTONE_LIKE = re.compile(r"^(?:pantone\s*)?\d{2,4}\s*[A-Z]?$", re.IGNORECASE)
+_RE_FILE_PATH_LIKE = re.compile(r"[/\\]|\.pdf$|\.xlsx?$", re.IGNORECASE)
+_RE_TERM_TOKEN = re.compile(r"[A-Za-z][A-Za-z&'’.\-]*")
+
+
+def normalize_term(term: str) -> str:
+    return re.sub(r"\s+", " ", str(term or "").strip()).lower()
+
+
+def is_noise_term(term: str) -> bool:
+    t = re.sub(r"\s+", " ", str(term or "").strip())
+    if not t:
+        return True
+    nl = t.lower()
+    alpha = re.findall(r"[A-Za-z]", t)
+    if not alpha:
+        return True
+    if nl in _TERM_STOPWORDS or nl in _BRAND_LIKE_TERMS:
+        return True
+    if len(t) <= 1:
+        return True
+    if _RE_FILE_PATH_LIKE.search(t):
+        return True
+    if _RE_DATE_LIKE.match(t) or _RE_STYLE_LIKE.match(t) or _RE_PANTONE_LIKE.match(t):
+        return True
+    if _is_passthrough_eligible(t):
+        return True
+    tokens = re.findall(r"[A-Za-z]+", t)
+    if tokens and all(tok.lower() in _TERM_STOPWORDS for tok in tokens):
+        return True
+    if len(tokens) == 1 and len(tokens[0]) <= 2:
+        return True
+    return False
+
+
+def extract_candidate_terms_from_text(text: str, glossary: dict) -> list[str]:
+    """Rule-based fallback candidate extraction from already-extracted text.
+    It favors short garment/process/material phrases and filters obvious codes.
+    """
+    cleaned = _clean_extracted_text(text)
+    if not cleaned:
+        return []
+    active_keys = {normalize_term(k) for k in glossary}
+    terms: list[str] = []
+
+    # Split on separators commonly used in tech packs, then keep compact phrases.
+    parts = re.split(r"[\n\r;,，。:：|()（）\[\]{}]+", cleaned)
+    for part in parts:
+        phrase = re.sub(r"\s+", " ", part).strip(" -_./")
+        if not phrase or is_noise_term(phrase):
+            continue
+        words = _RE_TERM_TOKEN.findall(phrase)
+        if not words:
+            continue
+        for n in range(min(4, len(words)), 0, -1):
+            for i in range(0, len(words) - n + 1):
+                cand = " ".join(words[i:i + n]).strip()
+                key = normalize_term(cand)
+                if key in active_keys or is_noise_term(cand):
+                    continue
+                if n == 1 and len(cand) < 4:
+                    continue
+                terms.append(cand)
+            if len(words) <= 4:
+                break
+
+    return list(dict.fromkeys(terms))[:12]
+
+
+def suggest_term_candidate_translations(
+    client: anthropic.Anthropic,
+    candidate_contexts: list[dict],
+    glossary: dict,
+) -> dict[str, dict]:
+    if not candidate_contexts:
+        return {}
+    rel = relevant_glossary(
+        "\n".join(f"{c['term']}\n{c.get('context', '')}" for c in candidate_contexts),
+        glossary,
+    )
+    gloss_block = ""
+    if rel:
+        lines = "\n".join(f"  {k} → {v}" for k, v in rel.items())
+        gloss_block = f"当前客户术语库参考（必须尊重既有译法）：\n{lines}\n\n"
+    items = "\n".join(
+        json.dumps(
+            {
+                "term": c["term"],
+                "context": c.get("context", ""),
+                "source_type": c.get("source_type", ""),
+            },
+            ensure_ascii=False,
+        )
+        for c in candidate_contexts[:60]
+    )
+    prompt = (
+        f"{gloss_block}"
+        "请为以下服装工艺术语候选给出适合加入客户术语库的中文建议译法。"
+        "结合上下文判断，不要只逐词直译；如果不确定，confidence 填 low。\n\n"
+        "<term_candidates>\n"
+        f"{items}\n"
+        "</term_candidates>\n\n"
+        "只返回 JSON，格式："
+        '{"items":[{"term":"英文术语","translation":"中文建议","confidence":"high|medium|low"}]}'
+    )
+    msg = client.messages.create(
+        model=ANTHROPIC_MODEL,
+        max_tokens=3072,
+        temperature=0,
+        system=_GARMENT_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = msg.content[0].text.strip()
+    raw = re.sub(r"^```[a-z]*\n?", "", raw)
+    raw = re.sub(r"\n?```$", "", raw)
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if m:
+        raw = m.group()
+    data = json.loads(raw)
+    out = {}
+    for item in data.get("items", []):
+        term = str(item.get("term", "")).strip()
+        if not term:
+            continue
+        out[normalize_term(term)] = {
+            "translation": str(item.get("translation", "")).strip(),
+            "confidence": str(item.get("confidence", "medium")).strip() or "medium",
+        }
+    return out
+
+
+def _pending_term_keys(customer_id: str) -> set[str]:
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT english_term_new
+            FROM glossary_change_requests
+            WHERE customer_id = ? AND status = 'pending' AND action_type IN ('add', 'update')
+            """,
+            (customer_id,),
+        ).fetchall()
+    return {normalize_term(r["english_term_new"]) for r in rows if r["english_term_new"]}
+
+
+def save_term_candidates(
+    customer_id: str,
+    source_file_name: str,
+    source_type: str,
+    created_by: str,
+    candidate_contexts: list[dict],
+    glossary: dict,
+    client: anthropic.Anthropic | None = None,
+) -> int:
+    if not customer_id or not candidate_contexts:
+        return 0
+    active_keys = {normalize_term(k) for k in glossary}
+    pending_keys = _pending_term_keys(customer_id)
+    merged: dict[str, dict] = {}
+    for item in candidate_contexts:
+        term = str(item.get("term", "")).strip()
+        key = normalize_term(term)
+        if not key or key in active_keys or key in pending_keys or is_noise_term(term):
+            continue
+        if key not in merged:
+            merged[key] = {
+                "term": term,
+                "context": str(item.get("context", "")).strip(),
+                "page_or_sheet": str(item.get("page_or_sheet", "")).strip(),
+                "cell_coordinate": str(item.get("cell_coordinate", "")).strip(),
+                "frequency": 0,
+                "source_type": source_type,
+            }
+        merged[key]["frequency"] += int(item.get("frequency", 1) or 1)
+        if item.get("context") and len(str(item["context"])) > len(merged[key]["context"]):
+            merged[key]["context"] = str(item["context"]).strip()
+
+    if not merged:
+        return 0
+
+    suggestions: dict[str, dict] = {}
+    if client is not None:
+        for batch in _chunk(list(merged.values()), 40):
+            try:
+                suggestions.update(suggest_term_candidate_translations(client, batch, glossary))
+            except Exception:
+                pass
+
+    now = _now_iso()
+    saved = 0
+    with get_db_connection() as conn:
+        for key, item in merged.items():
+            suggestion = suggestions.get(key, {})
+            zh = suggestion.get("translation", "")
+            confidence = suggestion.get("confidence", "medium")
+            existing = conn.execute(
+                """
+                SELECT candidate_id, frequency
+                FROM term_candidates
+                WHERE customer_id = ? AND normalized_term = ?
+                  AND status IN ('draft', 'selected')
+                ORDER BY candidate_id DESC
+                LIMIT 1
+                """,
+                (customer_id, key),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE term_candidates
+                    SET frequency = frequency + ?, context_sentence = ?,
+                        source_file_name = ?, source_type = ?, page_or_sheet = ?,
+                        cell_coordinate = ?,
+                        ai_suggested_translation = COALESCE(NULLIF(ai_suggested_translation, ''), ?),
+                        final_translation = COALESCE(NULLIF(final_translation, ''), ?),
+                        confidence = COALESCE(NULLIF(confidence, ''), ?)
+                    WHERE candidate_id = ?
+                    """,
+                    (
+                        item["frequency"],
+                        item["context"],
+                        source_file_name,
+                        source_type,
+                        item["page_or_sheet"],
+                        item["cell_coordinate"],
+                        zh,
+                        zh,
+                        confidence,
+                        existing["candidate_id"],
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO term_candidates (
+                        customer_id, source_file_name, source_type, page_or_sheet,
+                        cell_coordinate, original_term, normalized_term,
+                        ai_suggested_translation, final_translation, context_sentence,
+                        frequency, confidence, status, created_by, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)
+                    """,
+                    (
+                        customer_id,
+                        source_file_name,
+                        source_type,
+                        item["page_or_sheet"],
+                        item["cell_coordinate"],
+                        item["term"],
+                        key,
+                        zh,
+                        zh,
+                        item["context"],
+                        item["frequency"],
+                        confidence,
+                        created_by,
+                        now,
+                    ),
+                )
+            saved += 1
+    return saved
+
+
+def list_term_candidates(user: dict, customer_id: str | None = None, status: str | None = None) -> list[dict]:
+    where = []
+    params: list = []
+    accessible = get_accessible_customers(user)
+    ids = [c["customer_id"] for c in accessible]
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    where.append(f"tc.customer_id IN ({placeholders})")
+    params.extend(ids)
+    if customer_id:
+        if customer_id not in ids:
+            return []
+        where.append("tc.customer_id = ?")
+        params.append(customer_id)
+    if status and status != "全部":
+        where.append("tc.status = ?")
+        params.append(status)
+    sql = f"""
+        SELECT tc.*, c.customer_code, c.customer_name
+        FROM term_candidates tc
+        LEFT JOIN customers c ON c.customer_id = tc.customer_id
+        WHERE {' AND '.join(where)}
+        ORDER BY tc.created_at DESC, tc.candidate_id DESC
+    """
+    with get_db_connection() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def submit_term_candidates_for_approval(user: dict, edited_rows: list[dict]) -> tuple[int, list[str]]:
+    submitted = 0
+    errors: list[str] = []
+    pending_keys_cache: dict[str, set[str]] = {}
+    active_keys_cache: dict[str, set[str]] = {}
+    with get_db_connection() as conn:
+        for row in edited_rows:
+            candidate_id = int(row.get("candidate_id"))
+            customer_id = str(row.get("customer_id", "")).strip()
+            final_translation = str(row.get("final_translation", "")).strip()
+            note = str(row.get("note", "") or "").strip()
+            if not final_translation:
+                errors.append(f"#{candidate_id} 缺少人工确认中文")
+                continue
+            if not can_submit_glossary_change(user, customer_id):
+                errors.append(f"#{candidate_id} 无权提交该客户")
+                continue
+            candidate = conn.execute(
+                """
+                SELECT *
+                FROM term_candidates
+                WHERE candidate_id = ? AND customer_id = ? AND status IN ('draft', 'selected')
+                """,
+                (candidate_id, customer_id),
+            ).fetchone()
+            if candidate is None:
+                errors.append(f"#{candidate_id} 已提交或不存在")
+                continue
+            if customer_id not in active_keys_cache:
+                active_rows = conn.execute(
+                    "SELECT english_term FROM glossary_terms WHERE customer_id = ? AND status = 'active'",
+                    (customer_id,),
+                ).fetchall()
+                active_keys_cache[customer_id] = {normalize_term(r["english_term"]) for r in active_rows}
+            if customer_id not in pending_keys_cache:
+                pending_keys_cache[customer_id] = _pending_term_keys(customer_id)
+            key = normalize_term(candidate["original_term"])
+            if key in active_keys_cache[customer_id]:
+                conn.execute(
+                    "UPDATE term_candidates SET status = 'ignored' WHERE candidate_id = ?",
+                    (candidate_id,),
+                )
+                errors.append(f"{candidate['original_term']} 已在正式术语库中，已忽略")
+                continue
+            if key in pending_keys_cache[customer_id]:
+                errors.append(f"{candidate['original_term']} 已有待审批申请")
+                continue
+            source_note = (
+                f"candidate_id={candidate_id}；来源文件={candidate['source_file_name']}；"
+                f"来源位置={candidate['page_or_sheet']} {candidate['cell_coordinate'] or ''}；"
+                f"出现次数={candidate['frequency']}；置信度={candidate['confidence']}；"
+                f"上下文={candidate['context_sentence']}"
+            )
+            full_note = f"{note}；{source_note}" if note else source_note
+            req_id = create_glossary_change_request(
+                user,
+                customer_id,
+                "add",
+                english_term_new=candidate["original_term"],
+                chinese_translation_new=final_translation,
+                note=full_note,
+                candidate_id=candidate_id,
+            )
+            conn.execute(
+                """
+                UPDATE term_candidates
+                SET final_translation = ?, status = 'submitted', submitted_at = ?
+                WHERE candidate_id = ?
+                """,
+                (final_translation, _now_iso(), candidate_id),
+            )
+            pending_keys_cache[customer_id].add(key)
+            submitted += 1
+    return submitted, errors
+
+
 def create_glossary_change_request(
     user: dict,
     customer_id: str,
@@ -561,6 +970,7 @@ def create_glossary_change_request(
     english_term_new: str = "",
     chinese_translation_new: str = "",
     note: str = "",
+    candidate_id: int | None = None,
 ) -> int:
     if action_type not in {"add", "update", "delete"}:
         raise ValueError("不支持的术语申请类型")
@@ -571,16 +981,17 @@ def create_glossary_change_request(
         cur = conn.execute(
             """
             INSERT INTO glossary_change_requests (
-                customer_id, action_type,
+                customer_id, action_type, candidate_id,
                 english_term_old, chinese_translation_old,
                 english_term_new, chinese_translation_new,
                 note, submitted_by, submitted_at, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
             """,
             (
                 customer_id,
                 action_type,
+                candidate_id,
                 english_term_old.strip(),
                 chinese_translation_old.strip(),
                 english_term_new.strip(),
@@ -865,6 +1276,19 @@ def approve_glossary_change_request(request_id: int, reviewer: dict, comment: st
         if request_row is None or request_row["status"] != "approved":
             raise ValueError("申请不存在或已被处理")
         _apply_approved_glossary_change(conn, request_row)
+        try:
+            candidate_id = request_row["candidate_id"]
+        except (KeyError, IndexError):
+            candidate_id = None
+        if candidate_id:
+            conn.execute(
+                """
+                UPDATE term_candidates
+                SET status = 'approved'
+                WHERE candidate_id = ?
+                """,
+                (candidate_id,),
+            )
 
 
 def reject_glossary_change_request(request_id: int, reviewer: dict, comment: str = "") -> None:
@@ -881,6 +1305,19 @@ def reject_glossary_change_request(request_id: int, reviewer: dict, comment: str
         )
         if cur.rowcount != 1:
             raise ValueError("申请不存在或已被处理")
+        row = conn.execute(
+            "SELECT candidate_id FROM glossary_change_requests WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        if row and row["candidate_id"]:
+            conn.execute(
+                """
+                UPDATE term_candidates
+                SET status = 'rejected'
+                WHERE candidate_id = ?
+                """,
+                (row["candidate_id"],),
+            )
 
 
 def render_login_panel() -> dict | None:
@@ -1681,6 +2118,9 @@ def run_pdf_translation(
     on_page,
     on_block,
     on_progress,
+    customer_id: str | None = None,
+    source_file_name: str = "",
+    created_by: str = "",
 ) -> tuple[bytes, bytes, int]:
     """Returns (pdf_out, xlsx_out, n_unrecorded_terms)."""
     glossary = load_glossary(glossary_bytes)
@@ -1688,6 +2128,7 @@ def run_pdf_translation(
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     total_pages = len(doc)
     all_unrecorded: set[str] = set()
+    candidate_contexts: list[dict] = []
 
     # 以 span 为最小单元预扫描：bbox 精确到每一段文字，数字 span 绝不擦除
     page_spans: list[list[dict]] = []
@@ -1740,10 +2181,30 @@ def run_pdf_translation(
             try:
                 mapping, unrecorded_batch = translate_batch(client, texts, glossary)
                 all_unrecorded |= unrecorded_batch
+                for term in unrecorded_batch:
+                    context = next(
+                        (t for t in texts if normalize_term(term) in normalize_term(t)),
+                        texts[0] if texts else "",
+                    )
+                    candidate_contexts.append({
+                        "term": term,
+                        "context": context,
+                        "page_or_sheet": f"第 {pn + 1} 页",
+                        "cell_coordinate": "",
+                        "source_type": "PDF",
+                    })
             except Exception as exc:
                 raise RuntimeError(f"批量翻译 API 调用失败：{exc}") from exc
 
             for sp in batch:
+                for term in extract_candidate_terms_from_text(sp["clean_text"], glossary)[:5]:
+                    candidate_contexts.append({
+                        "term": term,
+                        "context": sp["clean_text"],
+                        "page_or_sheet": f"第 {pn + 1} 页",
+                        "cell_coordinate": "",
+                        "source_type": "PDF",
+                    })
                 translated = mapping.get(sp["clean_text"], "")
                 if _needs_retranslation(sp["clean_text"], translated):
                     try:
@@ -1784,6 +2245,17 @@ def run_pdf_translation(
         ws.column_dimensions["A"].width = 45
 
         wb.save(xlsx_buf)
+
+    if customer_id and source_file_name and created_by:
+        save_term_candidates(
+            customer_id=customer_id,
+            source_file_name=source_file_name,
+            source_type="PDF",
+            created_by=created_by,
+            candidate_contexts=candidate_contexts,
+            glossary=glossary,
+            client=client,
+        )
 
     return pdf_buf.getvalue(), xlsx_buf.getvalue(), len(all_unrecorded)
 
@@ -1863,6 +2335,9 @@ def run_excel_translation(
     on_cell,
     on_progress,
     translate_images: bool = False,
+    customer_id: str | None = None,
+    source_file_name: str = "",
+    created_by: str = "",
 ) -> tuple[bytes, int, int, list[dict]]:
     """Translate text cells (in place, formulas untouched) across ALL sheets.
     Embedded-image text translation is OFF by default (translate_images=False) —
@@ -1888,6 +2363,7 @@ def run_excel_translation(
     n_cells = len(to_translate)
     total_steps = max(n_cells, 1)
     report_rows: list[dict] = []
+    candidate_contexts: list[dict] = []
 
     for i, (sheet_name, ws, cell) in enumerate(to_translate):
         on_cell(f"[{sheet_name}] {str(cell.value)[:50].replace(chr(10), ' ')}")
@@ -1921,6 +2397,14 @@ def run_excel_translation(
                     wrap_text=True, text_rotation=align.text_rotation,
                     indent=align.indent,
                 )
+            for term in extract_candidate_terms_from_text(original, glossary)[:8]:
+                candidate_contexts.append({
+                    "term": term,
+                    "context": original,
+                    "page_or_sheet": sheet_name,
+                    "cell_coordinate": cell.coordinate,
+                    "source_type": "Excel",
+                })
         except Exception as e:
             row_report["status"] = "error"
             row_report["skip_reason"] = str(e)
@@ -1936,6 +2420,16 @@ def run_excel_translation(
     # 关闭原因：会把中文像素烧录进图片本身（不可编辑），且依赖视觉模型估算的
     # 坐标（容易跟实际版式错位/串位）。保留函数实现，按需再开启。
     if not translate_images:
+        if customer_id and source_file_name and created_by:
+            save_term_candidates(
+                customer_id=customer_id,
+                source_file_name=source_file_name,
+                source_type="Excel",
+                created_by=created_by,
+                candidate_contexts=candidate_contexts,
+                glossary=glossary,
+                client=client,
+            )
         on_progress(1.0)
         return text_done_bytes, n_cells, 0, report_rows
 
@@ -1954,6 +2448,16 @@ def run_excel_translation(
         on_progress(0.6 + idx / total * 0.4)   # 后 40% 进度给图片翻译
 
     final_bytes = translate_images_in_excel(text_done_bytes, client, glossary, on_image)
+    if customer_id and source_file_name and created_by:
+        save_term_candidates(
+            customer_id=customer_id,
+            source_file_name=source_file_name,
+            source_type="Excel",
+            created_by=created_by,
+            candidate_contexts=candidate_contexts,
+            glossary=glossary,
+            client=client,
+        )
     on_progress(1.0)
     return final_bytes, n_cells, n_images, report_rows
 
@@ -2487,16 +2991,16 @@ api_key = st.text_input(
 )
 st.divider()
 
-tab_labels = ["📄 PDF 翻译（支持批量）", "📊 Excel 翻译", "📚 客户术语库"]
+tab_labels = ["📄 PDF 翻译（支持批量）", "📊 Excel 翻译", "📚 客户术语库", "🧩 术语候选"]
 if can_approve_glossary_change(current_user):
     tab_labels.append("✅ 术语审批")
     tab_labels.append("👤 用户管理")
     tab_labels.append("🏢 客户管理")
 tabs = st.tabs(tab_labels)
-tab_pdf, tab_excel, tab_glossary = tabs[:3]
-tab_approval = tabs[3] if len(tabs) > 3 else None
-tab_user_admin = tabs[4] if len(tabs) > 4 else None
-tab_customer_admin = tabs[5] if len(tabs) > 5 else None
+tab_pdf, tab_excel, tab_glossary, tab_candidates = tabs[:4]
+tab_approval = tabs[4] if len(tabs) > 4 else None
+tab_user_admin = tabs[5] if len(tabs) > 5 else None
+tab_customer_admin = tabs[6] if len(tabs) > 6 else None
 
 # ════════════════════════════════════════════════════════════════════════════
 #  PDF Tab — batch upload, independent processing per file
@@ -2583,6 +3087,9 @@ with tab_pdf:
                             on_page=on_page,
                             on_block=on_block,
                             on_progress=on_progress,
+                            customer_id=selected_customer_id,
+                            source_file_name=pf.name,
+                            created_by=current_user["username"],
                         )
                         block_ph.empty()
                         status.update(label=f"✅ {pf.name} 翻译完成", state="complete")
@@ -2873,6 +3380,9 @@ with tab_excel:
                         on_cell=on_cell,
                         on_progress=on_progress,
                         translate_images=False,
+                        customer_id=selected_customer_id,
+                        source_file_name=ef.name,
+                        created_by=current_user["username"],
                     )
 
                     img_report_rows = []
@@ -3094,6 +3604,143 @@ with tab_glossary:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  Term Candidates Tab
+# ════════════════════════════════════════════════════════════════════════════
+with tab_candidates:
+    accessible_customers = get_accessible_customers(current_user)
+    if not accessible_customers:
+        st.warning("当前用户没有可访问客户。")
+    else:
+        candidate_customer_options = ["全部"] + [c["customer_id"] for c in accessible_customers]
+        candidate_customer_labels = {
+            c["customer_id"]: f"{c['customer_code']} / {c['customer_name']}"
+            for c in accessible_customers
+        }
+        fc, fs = st.columns(2)
+        with fc:
+            default_candidate_customer = (
+                selected_customer_id if selected_customer_id in candidate_customer_options else "全部"
+            )
+            candidate_customer = st.selectbox(
+                "客户",
+                candidate_customer_options,
+                index=candidate_customer_options.index(default_candidate_customer),
+                format_func=lambda cid: "全部" if cid == "全部" else candidate_customer_labels.get(cid, cid),
+                key="candidate_customer_filter",
+            )
+        with fs:
+            candidate_status = st.selectbox(
+                "状态",
+                ["draft", "selected", "submitted", "ignored", "approved", "rejected", "全部"],
+                key="candidate_status_filter",
+            )
+
+        candidates = list_term_candidates(
+            current_user,
+            customer_id=None if candidate_customer == "全部" else candidate_customer,
+            status=candidate_status,
+        )
+        if not candidates:
+            st.info("当前没有符合条件的术语候选。翻译 PDF / Excel 后会自动生成候选。")
+        else:
+            rows = []
+            for c in candidates:
+                rows.append({
+                    "是否提交": False,
+                    "忽略": False,
+                    "candidate_id": c["candidate_id"],
+                    "customer_id": c["customer_id"],
+                    "客户": f"{c.get('customer_code') or c['customer_id']} / {c.get('customer_name') or ''}",
+                    "英文术语": c["original_term"],
+                    "AI建议中文": c["ai_suggested_translation"],
+                    "人工确认中文": c["final_translation"] or c["ai_suggested_translation"],
+                    "出现次数": c["frequency"],
+                    "来源文件": c["source_file_name"],
+                    "来源类型": c["source_type"],
+                    "来源位置": c["page_or_sheet"],
+                    "单元格": c["cell_coordinate"],
+                    "上下文": c["context_sentence"],
+                    "置信度": c["confidence"],
+                    "状态": c["status"],
+                    "备注": "",
+                })
+            editor_df = pd.DataFrame(rows)
+            edited_df = st.data_editor(
+                editor_df,
+                use_container_width=True,
+                hide_index=True,
+                height=420,
+                disabled=[
+                    "candidate_id", "customer_id", "客户", "英文术语", "AI建议中文",
+                    "出现次数", "来源文件", "来源类型", "来源位置", "单元格",
+                    "上下文", "置信度", "状态",
+                ],
+                column_config={
+                    "是否提交": st.column_config.CheckboxColumn("是否提交"),
+                    "忽略": st.column_config.CheckboxColumn("忽略"),
+                    "人工确认中文": st.column_config.TextColumn("人工确认中文", required=False),
+                    "备注": st.column_config.TextColumn("备注"),
+                },
+                key="term_candidates_editor",
+            )
+
+            submit_col, ignore_col = st.columns(2)
+            with submit_col:
+                submit_candidates = st.button(
+                    "一键提交审核",
+                    type="primary",
+                    use_container_width=True,
+                    key="submit_term_candidates_btn",
+                )
+            with ignore_col:
+                ignore_candidates = st.button(
+                    "忽略勾选候选",
+                    use_container_width=True,
+                    key="ignore_term_candidates_btn",
+                )
+
+            if submit_candidates:
+                selected_rows = []
+                for _, row in edited_df[edited_df["是否提交"] == True].iterrows():
+                    selected_rows.append({
+                        "candidate_id": int(row["candidate_id"]),
+                        "customer_id": row["customer_id"],
+                        "final_translation": row["人工确认中文"],
+                        "note": row.get("备注", ""),
+                    })
+                if not selected_rows:
+                    st.warning("请先勾选要提交的候选术语。")
+                else:
+                    submitted_count, errors = submit_term_candidates_for_approval(current_user, selected_rows)
+                    if submitted_count:
+                        st.success(f"已提交 **{submitted_count}** 条术语候选，等待管理员审批。")
+                    if errors:
+                        st.warning("；".join(errors[:10]))
+                    st.rerun()
+
+            if ignore_candidates:
+                ignore_ids = [
+                    int(row["candidate_id"])
+                    for _, row in edited_df[edited_df["忽略"] == True].iterrows()
+                ]
+                if not ignore_ids:
+                    st.warning("请先勾选要忽略的候选术语。")
+                else:
+                    placeholders = ",".join("?" for _ in ignore_ids)
+                    with get_db_connection() as conn:
+                        conn.execute(
+                            f"""
+                            UPDATE term_candidates
+                            SET status = 'ignored'
+                            WHERE candidate_id IN ({placeholders})
+                            """,
+                            ignore_ids,
+                        )
+                    st.success(f"已忽略 **{len(ignore_ids)}** 条候选。")
+                    st.rerun()
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  Approval Tab
 # ════════════════════════════════════════════════════════════════════════════
 if tab_approval is not None:
@@ -3132,7 +3779,7 @@ if tab_approval is not None:
             pending_df = pd.DataFrame(pending)
             st.dataframe(
                 pending_df[[
-                    "request_id", "customer_code", "customer_name", "action_type",
+                    "request_id", "candidate_id", "customer_code", "customer_name", "action_type",
                     "english_term_old", "chinese_translation_old",
                     "english_term_new", "chinese_translation_new",
                     "submitted_by", "submitted_at",
@@ -3151,6 +3798,8 @@ if tab_approval is not None:
             with detail_cols[0]:
                 st.write(f"客户：**{selected_request['customer_code']} / {selected_request['customer_name']}**")
                 st.write(f"类型：`{selected_request['action_type']}`")
+                if selected_request.get("candidate_id"):
+                    st.write(f"候选编号：`{selected_request['candidate_id']}`")
                 st.write(f"申请人：**{selected_request['submitted_by']}**")
                 st.write(f"提交时间：{selected_request['submitted_at']}")
             with detail_cols[1]:
