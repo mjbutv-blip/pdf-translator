@@ -2373,6 +2373,242 @@ def _insert_text(page, bbox, text: str, size: float, font_path: str):
                         fontsize=7.0, color=(0.7, 0, 0), align=0)
 
 
+_WORKMANSHIP_KEYWORDS = {
+    "details of design": 6,
+    "workmanship": 6,
+    "construction": 5,
+    "sewing": 5,
+    "sketch": 4,
+    "stitching": 4,
+    "double stitching": 5,
+    "seam": 4,
+    "shoulder seam": 5,
+    "binding": 4,
+    "shell fabric binding": 6,
+    "snaps": 3,
+    "ring snaps": 4,
+    "printed label": 2,
+    "rubber print": 4,
+    "aop": 3,
+    "waterprint": 4,
+    "soft lacquer print": 5,
+    "rib": 3,
+    "ground color": 3,
+    "quality": 2,
+    "width": 2,
+    "matching color": 3,
+    "thread": 4,
+    "shell": 2,
+    "fabric": 3,
+    "finish": 3,
+    "handfeel": 3,
+}
+
+_NON_WORKMANSHIP_KEYWORDS = {
+    "labels": 6,
+    "labeling manual": 7,
+    "packaging": 6,
+    "packing": 5,
+    "plastic bag": 7,
+    "warning": 7,
+    "safety warning": 8,
+    "suffocation": 8,
+    "suffocation risk": 8,
+    "juguete": 7,
+    "brinquedo": 7,
+    "asfixia": 8,
+    "sufocação": 8,
+    "sufocacao": 8,
+    "bolsa de plástico": 7,
+    "bolsa de plastico": 7,
+    "saco de plástico": 7,
+    "saco de plastico": 7,
+    "barcode": 6,
+    "sticker": 5,
+    "hangtag": 5,
+    "manual": 5,
+    "size measurement": 4,
+    "measurement table": 4,
+}
+
+
+def _keyword_hits(text: str, keywords: dict[str, int]) -> tuple[int, list[str]]:
+    lowered = text.lower()
+    hits = [
+        kw for kw in keywords
+        if re.search(rf"(?<![a-z0-9]){re.escape(kw)}(?![a-z0-9])", lowered)
+    ]
+    return sum(keywords[kw] for kw in hits), hits
+
+
+def _short_label_score(lines: list[str]) -> int:
+    useful = [
+        ln for ln in lines
+        if re.search(r"[a-zA-Z]", ln) and 2 <= len(ln.split()) <= 8 and len(ln) <= 70
+    ]
+    if len(useful) >= 18:
+        return 3
+    if len(useful) >= 10:
+        return 2
+    if len(useful) >= 5:
+        return 1
+    return 0
+
+
+def detect_workmanship_pages(pdf_bytes: bytes) -> list[dict]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    rows: list[dict] = []
+    try:
+        for idx, page in enumerate(doc):
+            text = page.get_text("text") or ""
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            title_text = "\n".join(lines[:6])
+            pos_score, pos_hits = _keyword_hits(text, _WORKMANSHIP_KEYWORDS)
+            neg_score, neg_hits = _keyword_hits(text, _NON_WORKMANSHIP_KEYWORDS)
+            title_bonus, title_hits = _keyword_hits(title_text, {
+                "details of design": 8,
+                "workmanship": 8,
+                "construction": 6,
+                "sewing": 6,
+                "sketch": 5,
+            })
+            label_score = _short_label_score(lines)
+            image_bonus = 2 if sum(1 for b in page.get_text("dict")["blocks"] if b["type"] == 1) >= 1 else 0
+            score = pos_score + title_bonus + label_score + image_bonus - neg_score
+            is_workmanship = score >= 3 and not (neg_score >= 7 and pos_score + title_bonus < 6)
+            reason_bits = []
+            if title_hits:
+                reason_bits.append("标题命中：" + "、".join(title_hits))
+            if pos_hits:
+                reason_bits.append("做工词：" + "、".join(pos_hits[:8]))
+            if label_score:
+                reason_bits.append(f"短标注较多(+{label_score})")
+            if image_bonus:
+                reason_bits.append("含图片/图稿")
+            if neg_hits:
+                reason_bits.append("排除词：" + "、".join(neg_hits[:8]))
+            rows.append({
+                "page_index": idx,
+                "page_number": idx + 1,
+                "score": score,
+                "is_workmanship": is_workmanship,
+                "reason": "；".join(reason_bits) if reason_bits else "未命中明显做工特征",
+            })
+    finally:
+        doc.close()
+    return rows
+
+
+def detect_workmanship_sheets(xlsx_bytes: bytes) -> list[dict]:
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), read_only=True, data_only=True)
+    rows: list[dict] = []
+    try:
+        for ws in wb.worksheets:
+            values = []
+            for row in ws.iter_rows(max_row=40, values_only=True):
+                for value in row:
+                    if isinstance(value, str) and value.strip():
+                        values.append(value.strip())
+            sample_text = f"{ws.title}\n" + "\n".join(values[:300])
+            pos_score, pos_hits = _keyword_hits(sample_text, _WORKMANSHIP_KEYWORDS)
+            neg_score, neg_hits = _keyword_hits(sample_text, _NON_WORKMANSHIP_KEYWORDS)
+            title_bonus, title_hits = _keyword_hits(ws.title, {
+                "f. técnica": 6,
+                "f. tecnica": 6,
+                "técnica": 5,
+                "tecnica": 5,
+                "workmanship": 7,
+                "construction": 6,
+                "details": 4,
+                "measurements spec": 5,
+                "spec": 2,
+            })
+            score = pos_score + title_bonus - neg_score
+            if score >= 4:
+                verdict = "做工"
+            elif score <= -3:
+                verdict = "非做工"
+            else:
+                verdict = "不确定"
+            reason_bits = []
+            if title_hits:
+                reason_bits.append("Sheet 名命中：" + "、".join(title_hits))
+            if pos_hits:
+                reason_bits.append("做工词：" + "、".join(pos_hits[:8]))
+            if neg_hits:
+                reason_bits.append("排除词：" + "、".join(neg_hits[:8]))
+            rows.append({
+                "sheet_name": ws.title,
+                "score": score,
+                "verdict": verdict,
+                "is_workmanship": verdict == "做工",
+                "reason": "；".join(reason_bits) if reason_bits else "未命中明显做工特征",
+            })
+    finally:
+        wb.close()
+    return rows
+
+
+def format_page_ranges(page_numbers: list[int]) -> str:
+    nums = sorted(set(n for n in page_numbers if n > 0))
+    if not nums:
+        return ""
+    ranges = []
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        ranges.append(str(start) if start == prev else f"{start}-{prev}")
+        start = prev = n
+    ranges.append(str(start) if start == prev else f"{start}-{prev}")
+    return ",".join(ranges)
+
+
+def parse_page_ranges(text: str, total_pages: int) -> tuple[list[int], list[str]]:
+    pages: set[int] = set()
+    errors: list[str] = []
+    for part in re.split(r"[,\s，]+", text.strip()):
+        if not part:
+            continue
+        if "-" in part:
+            bits = part.split("-", 1)
+            if len(bits) != 2 or not bits[0].isdigit() or not bits[1].isdigit():
+                errors.append(f"无法识别页码范围：{part}")
+                continue
+            start, end = int(bits[0]), int(bits[1])
+            if start > end:
+                errors.append(f"页码范围起点大于终点：{part}")
+                continue
+            pages.update(range(start, end + 1))
+        elif part.isdigit():
+            pages.add(int(part))
+        else:
+            errors.append(f"无法识别页码：{part}")
+    invalid = sorted(n for n in pages if n < 1 or n > total_pages)
+    if invalid:
+        errors.append(f"页码超出文件范围：{format_page_ranges(invalid)}")
+    valid = sorted(n for n in pages if 1 <= n <= total_pages)
+    return [n - 1 for n in valid], errors
+
+
+def build_scope_report_xlsx(rows: list[dict], title: str = "翻译范围报告") -> bytes:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = title[:31]
+    headers = ["file_name", "source_type", "scope_mode", "item", "selected", "score", "reason"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = openpyxl.styles.Font(bold=True)
+    for r in rows:
+        ws.append([r.get(h, "") for h in headers])
+    for col_letter, width in zip("ABCDEFG", [28, 12, 18, 20, 10, 10, 80]):
+        ws.column_dimensions[col_letter].width = width
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 def run_pdf_translation(
     pdf_bytes: bytes,
     glossary_bytes: bytes,
@@ -2384,18 +2620,27 @@ def run_pdf_translation(
     customer_id: str | None = None,
     source_file_name: str = "",
     created_by: str = "",
+    selected_pages: list[int] | None = None,
+    scope_mode: str = "all",
+    scope_detection: list[dict] | None = None,
 ) -> tuple[bytes, bytes, int]:
     """Returns (pdf_out, xlsx_out, n_unrecorded_terms)."""
     glossary = load_glossary(glossary_bytes)
     client = anthropic.Anthropic(api_key=api_key)
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     total_pages = len(doc)
+    selected_page_set = None if selected_pages is None else {
+        pn for pn in selected_pages if 0 <= pn < total_pages
+    }
     all_unrecorded: set[str] = set()
     candidate_contexts: list[dict] = []
 
     # 以 span 为最小单元预扫描：bbox 精确到每一段文字，数字 span 绝不擦除
     page_spans: list[list[dict]] = []
     for pn in range(total_pages):
+        if selected_page_set is not None and pn not in selected_page_set:
+            page_spans.append([])
+            continue
         ts = []
         for blk in doc[pn].get_text("dict")["blocks"]:
             if blk["type"] != 0:
@@ -2416,6 +2661,8 @@ def run_pdf_translation(
     done = 0
 
     for pn, spans in enumerate(page_spans):
+        if selected_page_set is not None and pn not in selected_page_set:
+            continue
         page = doc[pn]
         on_page(pn, total_pages, len(spans))
 
@@ -2491,6 +2738,8 @@ def run_pdf_translation(
             if r["translated"].strip().lower() == r["clean_text"].strip().lower():
                 continue
             _insert_text(page, r["bbox"], r["translated"], r["size"], font_path)
+
+    on_progress(1.0)
 
     pdf_buf = io.BytesIO()
     doc.save(pdf_buf, garbage=4, deflate=True)
@@ -2601,6 +2850,9 @@ def run_excel_translation(
     customer_id: str | None = None,
     source_file_name: str = "",
     created_by: str = "",
+    selected_sheets: list[str] | None = None,
+    scope_mode: str = "all",
+    scope_detection: list[dict] | None = None,
 ) -> tuple[bytes, int, int, list[dict]]:
     """Translate text cells (in place, formulas untouched) across ALL sheets.
     Embedded-image text translation is OFF by default (translate_images=False) —
@@ -2615,10 +2867,16 @@ def run_excel_translation(
     # 不用 data_only=True：公式必须保留原样（"="开头的字符串），否则保存时
     # 公式会被永久替换成当时的计算结果，且无法恢复。
     wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
+    selected_sheet_set = None if selected_sheets is None else set(selected_sheets)
+    skipped_sheets = [
+        ws.title for ws in wb.worksheets
+        if selected_sheet_set is not None and ws.title not in selected_sheet_set
+    ]
 
     to_translate = [
         (ws.title, ws, cell)
         for ws in wb.worksheets
+        if selected_sheet_set is None or ws.title in selected_sheet_set
         for row in ws.iter_rows()
         for cell in row
         if _is_translatable(cell.value)
@@ -2627,6 +2885,29 @@ def run_excel_translation(
     total_steps = max(n_cells, 1)
     report_rows: list[dict] = []
     candidate_contexts: list[dict] = []
+    detection_by_sheet = {
+        row.get("sheet_name"): row
+        for row in (scope_detection or [])
+        if row.get("sheet_name")
+    }
+
+    for sheet_name in skipped_sheets:
+        det = detection_by_sheet.get(sheet_name, {})
+        report_rows.append({
+            "sheet_name": sheet_name,
+            "cell_coordinate": "",
+            "original_text": "",
+            "translated_text": "",
+            "status": "skipped_sheet",
+            "skip_reason": "未包含在本次翻译范围",
+            "is_merged_cell": False,
+            "layout_warning": False,
+            "scope_mode": scope_mode,
+            "selected_sheets": ", ".join(selected_sheets or []),
+            "skipped_sheets": ", ".join(skipped_sheets),
+            "detection_score": det.get("score", ""),
+            "detection_reason": det.get("reason", ""),
+        })
 
     for i, (sheet_name, ws, cell) in enumerate(to_translate):
         on_cell(f"[{sheet_name}] {str(cell.value)[:50].replace(chr(10), ' ')}")
@@ -2641,6 +2922,11 @@ def run_excel_translation(
             "skip_reason": "",
             "is_merged_cell": is_merged,
             "layout_warning": False,
+            "scope_mode": scope_mode,
+            "selected_sheets": ", ".join(selected_sheets or []),
+            "skipped_sheets": ", ".join(skipped_sheets),
+            "detection_score": detection_by_sheet.get(sheet_name, {}).get("score", ""),
+            "detection_reason": detection_by_sheet.get(sheet_name, {}).get("reason", ""),
         }
 
         try:
@@ -3097,6 +3383,7 @@ def add_translated_textboxes_to_excel(
     client: anthropic.Anthropic,
     glossary: dict,
     on_image,
+    selected_sheets: list[str] | None = None,
 ) -> tuple[bytes, list[dict]]:
     """图片像素完全不动；每条识别出的英文标注生成一个独立、可编辑、可拖动的
     Excel TextBox（黄底+中文），定位在原图片范围内对应的相对坐标处。
@@ -3109,6 +3396,7 @@ def add_translated_textboxes_to_excel(
     # 这里只读不存，不会重新触发 openpyxl 的整书写出（那个交给 run_excel_translation）。
     dims_wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
     drawing_sheet_name = _drawing_to_sheet_name(all_data)
+    selected_sheet_set = None if selected_sheets is None else set(selected_sheets)
 
     drawing_paths = sorted(
         n for n in all_data if re.match(r"xl/drawings/drawing\d+\.xml$", n)
@@ -3163,6 +3451,11 @@ def add_translated_textboxes_to_excel(
             _ox, _oy, cx, cy = extent  # ox/oy 是图片内部历史遗留的局部坐标，不可信，不用它
 
             sheet_name = drawing_sheet_name.get(dp)
+            if selected_sheet_set is not None and sheet_name not in selected_sheet_set:
+                report_rows.append({"drawing": dp, "image": fname, "status": "skipped",
+                                     "original_text": "", "translated_text": "",
+                                     "skip_reason": "图片所在 Sheet 未包含在本次翻译范围"})
+                continue
             ws = dims_wb[sheet_name] if sheet_name in dims_wb.sheetnames else None
             if ws is None:
                 report_rows.append({"drawing": dp, "image": fname, "status": "skipped",
@@ -3285,8 +3578,70 @@ with tab_pdf:
     selected_glossary_count = len(get_customer_glossary_df(selected_customer_id)) if selected_customer_id else 0
     st.caption(f"📚 当前客户术语库：**{selected_customer_id or '未选择'}** · {selected_glossary_count} 条 active 术语")
 
+    pdf_scope_choice = st.radio(
+        "翻译范围",
+        ["all", "workmanship_auto", "manual"],
+        format_func=lambda v: {
+            "all": "全部页面",
+            "workmanship_auto": "自动识别做工页",
+            "manual": "手动选择页面",
+        }[v],
+        horizontal=True,
+        key="pdf_scope_choice",
+    )
+    pdf_scope_configs: dict[str, dict] = {}
+    pdf_scope_errors: list[str] = []
+    if pdf_files and pdf_scope_choice != "all":
+        st.caption("页码请按 PDF 阅读器里的页码填写，从 1 开始，例如：1-7,10。")
+        for file_idx, pf in enumerate(pdf_files):
+            pdf_bytes_for_scope = pf.getvalue()
+            detection_rows = []
+            try:
+                if pdf_scope_choice == "workmanship_auto":
+                    detection_rows = detect_workmanship_pages(pdf_bytes_for_scope)
+                    total_pages = len(detection_rows)
+                    default_pages = [
+                        row["page_number"] for row in detection_rows
+                        if row["is_workmanship"]
+                    ]
+                else:
+                    doc_for_count = fitz.open(stream=pdf_bytes_for_scope, filetype="pdf")
+                    total_pages = len(doc_for_count)
+                    doc_for_count.close()
+                    default_pages = list(range(1, total_pages + 1))
+                default_range = format_page_ranges(default_pages)
+                with st.expander(f"翻译范围确认：{pf.name}", expanded=True):
+                    if detection_rows:
+                        preview_df = pd.DataFrame([{
+                            "页码": row["page_number"],
+                            "判断": "做工" if row["is_workmanship"] else "跳过",
+                            "分数": row["score"],
+                            "原因": row["reason"],
+                        } for row in detection_rows])
+                        st.dataframe(preview_df, use_container_width=True, hide_index=True, height=240)
+                    page_range = st.text_input(
+                        "本文件实际翻译页码",
+                        value=default_range,
+                        key=f"pdf_scope_pages_{file_idx}_{pf.name}",
+                    )
+                selected_pages, page_errors = parse_page_ranges(page_range, total_pages)
+                if page_errors:
+                    pdf_scope_errors.extend([f"{pf.name}：{err}" for err in page_errors])
+                if not selected_pages:
+                    pdf_scope_errors.append(f"{pf.name}：至少选择 1 页。")
+                pdf_scope_configs[pf.name] = {
+                    "selected_pages": selected_pages,
+                    "detection": detection_rows,
+                    "total_pages": total_pages,
+                    "page_range": page_range,
+                }
+            except Exception as exc:
+                pdf_scope_errors.append(f"{pf.name}：范围识别失败：{exc}")
+        for err in pdf_scope_errors:
+            st.error(err)
+
     customer_ready = bool(selected_customer_id and can_use_customer_glossary(current_user, selected_customer_id))
-    can_start_pdf = bool(pdf_files and api_key and font_ready and customer_ready)
+    can_start_pdf = bool(pdf_files and api_key and font_ready and customer_ready and not pdf_scope_errors)
     if not can_start_pdf:
         missing = []
         if not pdf_files:
@@ -3342,8 +3697,16 @@ with tab_pdf:
                         file_prog.progress(frac, text=f"翻译进度 {frac:.0%}")
 
                     try:
+                        pdf_input_bytes = pf.getvalue()
+                        scope_cfg = pdf_scope_configs.get(pf.name, {})
+                        if pdf_scope_choice == "all":
+                            doc_for_count = fitz.open(stream=pdf_input_bytes, filetype="pdf")
+                            scope_cfg = {"total_pages": len(doc_for_count), "detection": []}
+                            doc_for_count.close()
+                        selected_pages = None if pdf_scope_choice == "all" else scope_cfg.get("selected_pages")
+                        scope_detection = scope_cfg.get("detection") if pdf_scope_choice != "all" else []
                         pdf_out, xlsx_out, n_terms = run_pdf_translation(
-                            pdf_bytes=pf.read(),
+                            pdf_bytes=pdf_input_bytes,
                             glossary_bytes=glossary_bytes,
                             font_path=font_path,
                             api_key=api_key,
@@ -3353,7 +3716,31 @@ with tab_pdf:
                             customer_id=selected_customer_id,
                             source_file_name=pf.name,
                             created_by=current_user["username"],
+                            selected_pages=selected_pages,
+                            scope_mode=pdf_scope_choice,
+                            scope_detection=scope_detection,
                         )
+                        selected_page_nums = [
+                            pn + 1 for pn in (selected_pages or [])
+                        ] if selected_pages is not None else list(range(1, scope_cfg.get("total_pages", 0) + 1))
+                        detection_by_page = {
+                            row.get("page_number"): row for row in (scope_detection or [])
+                        }
+                        total_pages = scope_cfg.get("total_pages") or len(detection_by_page)
+                        scope_report_rows = []
+                        if total_pages:
+                            selected_set = set(selected_page_nums)
+                            for page_number in range(1, total_pages + 1):
+                                det = detection_by_page.get(page_number, {})
+                                scope_report_rows.append({
+                                    "file_name": pf.name,
+                                    "source_type": "PDF",
+                                    "scope_mode": pdf_scope_choice,
+                                    "item": f"第 {page_number} 页",
+                                    "selected": page_number in selected_set,
+                                    "score": det.get("score", ""),
+                                    "reason": det.get("reason", ""),
+                                })
                         block_ph.empty()
                         status.update(label=f"✅ {pf.name} 翻译完成", state="complete")
                         results.append({
@@ -3362,6 +3749,7 @@ with tab_pdf:
                             "pdf": pdf_out,
                             "xlsx": xlsx_out,
                             "n_terms": n_terms,
+                            "scope_report": scope_report_rows,
                         })
                     except Exception as e:
                         block_ph.empty()
@@ -3392,6 +3780,11 @@ with tab_pdf:
                     zf.writestr(f"{base}_translated.pdf", r["pdf"])
                     if r["n_terms"] > 0:
                         zf.writestr(f"{base}_unrecorded_terms.xlsx", r["xlsx"])
+                    if r.get("scope_report"):
+                        zf.writestr(
+                            f"{base}_翻译范围报告.xlsx",
+                            build_scope_report_xlsx(r["scope_report"]),
+                        )
             st.download_button(
                 label=f"⬇️  打包下载全部 {len(ok_results)} 个译文（ZIP）",
                 data=zip_buf.getvalue(),
@@ -3406,7 +3799,7 @@ with tab_pdf:
                 if r["ok"]:
                     base = r["name"].rsplit(".", 1)[0]
                     st.caption(f"未收录术语：{r['n_terms']} 条")
-                    dl1, dl2 = st.columns(2)
+                    dl1, dl2, dl3 = st.columns(3)
                     with dl1:
                         st.download_button(
                             label="⬇️  下载中文 PDF",
@@ -3426,6 +3819,16 @@ with tab_pdf:
                                 use_container_width=True,
                                 key=f"xlsx_dl_{i}",
                             )
+                    with dl3:
+                        if r.get("scope_report"):
+                            st.download_button(
+                                label="⬇️ 下载范围报告",
+                                data=build_scope_report_xlsx(r["scope_report"]),
+                                file_name=f"{base}_翻译范围报告.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                use_container_width=True,
+                                key=f"pdf_scope_report_dl_{i}",
+                            )
                 else:
                     st.error(r["error"])
 
@@ -3437,13 +3840,15 @@ def _build_excel_report_bytes(report_rows: list[dict], img_report_rows: list[dic
     report_ws = report_wb.active
     report_ws.title = "翻译报告"
     headers = ["sheet_name", "cell_coordinate", "original_text", "translated_text",
-               "status", "skip_reason", "is_merged_cell", "layout_warning"]
+               "status", "skip_reason", "is_merged_cell", "layout_warning",
+               "scope_mode", "selected_sheets", "skipped_sheets",
+               "detection_score", "detection_reason"]
     report_ws.append(headers)
     for cell in report_ws[1]:
         cell.font = openpyxl.styles.Font(bold=True)
     for r in report_rows:
-        report_ws.append([r[h] for h in headers])
-    for col_letter, width in zip("ABCDEFGH", [12, 14, 35, 35, 8, 20, 14, 14]):
+        report_ws.append([r.get(h, "") for h in headers])
+    for col_letter, width in zip("ABCDEFGHIJKLM", [12, 14, 35, 35, 12, 24, 14, 14, 18, 35, 35, 12, 70]):
         report_ws.column_dimensions[col_letter].width = width
 
     if img_report_rows:
@@ -3585,8 +3990,69 @@ with tab_excel:
     selected_glossary_count = len(get_customer_glossary_df(selected_customer_id)) if selected_customer_id else 0
     st.caption(f"📚 当前客户术语库：**{selected_customer_id or '未选择'}** · {selected_glossary_count} 条 active 术语")
 
+    excel_scope_choice = st.radio(
+        "翻译范围",
+        ["all", "workmanship_auto", "manual"],
+        format_func=lambda v: {
+            "all": "全部 Sheet",
+            "workmanship_auto": "自动识别做工 Sheet",
+            "manual": "手动选择 Sheet",
+        }[v],
+        horizontal=True,
+        key="excel_scope_choice",
+    )
+    excel_scope_configs: dict[str, dict] = {}
+    excel_scope_errors: list[str] = []
+    if excel_files and excel_scope_choice != "all":
+        for file_idx, ef in enumerate(excel_files):
+            excel_bytes_for_scope = ef.getvalue()
+            detection_rows = []
+            try:
+                if excel_scope_choice == "workmanship_auto":
+                    detection_rows = detect_workmanship_sheets(excel_bytes_for_scope)
+                    sheet_names = [row["sheet_name"] for row in detection_rows]
+                    default_sheets = [
+                        row["sheet_name"] for row in detection_rows
+                        if row["is_workmanship"]
+                    ]
+                else:
+                    wb_for_scope = openpyxl.load_workbook(
+                        io.BytesIO(excel_bytes_for_scope),
+                        read_only=True,
+                        data_only=True,
+                    )
+                    sheet_names = wb_for_scope.sheetnames
+                    wb_for_scope.close()
+                    default_sheets = sheet_names
+                with st.expander(f"Sheet 范围确认：{ef.name}", expanded=True):
+                    if detection_rows:
+                        preview_df = pd.DataFrame([{
+                            "Sheet": row["sheet_name"],
+                            "判断": row["verdict"],
+                            "分数": row["score"],
+                            "原因": row["reason"],
+                        } for row in detection_rows])
+                        st.dataframe(preview_df, use_container_width=True, hide_index=True, height=240)
+                    selected_sheets = st.multiselect(
+                        "本文件实际翻译 Sheet",
+                        options=sheet_names,
+                        default=default_sheets,
+                        key=f"excel_scope_sheets_{file_idx}_{ef.name}",
+                    )
+                if not selected_sheets:
+                    excel_scope_errors.append(f"{ef.name}：至少选择 1 个 Sheet。")
+                excel_scope_configs[ef.name] = {
+                    "selected_sheets": selected_sheets,
+                    "detection": detection_rows,
+                    "sheet_names": sheet_names,
+                }
+            except Exception as exc:
+                excel_scope_errors.append(f"{ef.name}：范围识别失败：{exc}")
+        for err in excel_scope_errors:
+            st.error(err)
+
     customer_ready = bool(selected_customer_id and can_use_customer_glossary(current_user, selected_customer_id))
-    can_start_excel = bool(excel_files and api_key and customer_ready)
+    can_start_excel = bool(excel_files and api_key and customer_ready and not excel_scope_errors)
     if not can_start_excel:
         missing = []
         if not excel_files:
@@ -3636,8 +4102,11 @@ with tab_excel:
                     file_prog.progress(frac, text=f"翻译进度 {frac:.0%}")
 
                 try:
+                    scope_cfg = excel_scope_configs.get(ef.name, {})
+                    selected_sheets = None if excel_scope_choice == "all" else scope_cfg.get("selected_sheets")
+                    scope_detection = scope_cfg.get("detection") if excel_scope_choice != "all" else []
                     excel_out, n_cells, n_images, report_rows = run_excel_translation(
-                        xlsx_bytes=ef.read(),
+                        xlsx_bytes=ef.getvalue(),
                         glossary_bytes=glossary_bytes,
                         api_key=api_key,
                         on_cell=on_cell,
@@ -3646,6 +4115,9 @@ with tab_excel:
                         customer_id=selected_customer_id,
                         source_file_name=ef.name,
                         created_by=current_user["username"],
+                        selected_sheets=selected_sheets,
+                        scope_mode=excel_scope_choice,
+                        scope_detection=scope_detection,
                     )
 
                     img_report_rows = []
@@ -3658,6 +4130,7 @@ with tab_excel:
                         client = anthropic.Anthropic(api_key=api_key)
                         excel_out, img_report_rows = add_translated_textboxes_to_excel(
                             excel_out, client, glossary_dict, on_image,
+                            selected_sheets=selected_sheets,
                         )
                         img_ph.empty()
 
