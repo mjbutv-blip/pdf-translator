@@ -89,7 +89,10 @@ class DbConnection:
         return self.conn.execute(_pg_sql(sql) if self.is_postgres else sql, params)
 
     def executemany(self, sql: str, seq_of_params):
-        return self.conn.executemany(_pg_sql(sql) if self.is_postgres else sql, seq_of_params)
+        if not self.is_postgres:
+            return self.conn.executemany(sql, seq_of_params)
+        with self.conn.cursor() as cur:
+            return cur.executemany(_pg_sql(sql), seq_of_params)
 
     def executescript(self, sql: str) -> None:
         if not self.is_postgres:
