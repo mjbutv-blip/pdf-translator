@@ -40,6 +40,37 @@ def _database_url() -> str:
 
 
 ANTHROPIC_MODEL = _secret_or_env("ANTHROPIC_MODEL", ANTHROPIC_MODEL)
+ANTHROPIC_FALLBACK_MODELS = [
+    model.strip()
+    for model in _secret_or_env(
+        "ANTHROPIC_FALLBACK_MODELS",
+        "claude-3-5-sonnet-20241022,claude-3-5-haiku-20241022,claude-3-haiku-20240307",
+    ).split(",")
+    if model.strip()
+]
+
+
+def _model_not_found_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    text = str(exc).lower()
+    return status_code == 404 and "model:" in text and "not_found" in text
+
+
+def _create_anthropic_message(client: anthropic.Anthropic, **kwargs):
+    requested_model = kwargs.pop("model", ANTHROPIC_MODEL)
+    models_to_try = list(dict.fromkeys([requested_model, *ANTHROPIC_FALLBACK_MODELS]))
+    for model in models_to_try:
+        try:
+            return client.messages.create(model=model, **kwargs)
+        except Exception as exc:
+            if _model_not_found_error(exc):
+                continue
+            raise
+    raise RuntimeError(
+        "所有配置的 Anthropic 模型都不可用。请检查 API key 所属账号可用模型，"
+        "或在 Streamlit Secrets 里设置 ANTHROPIC_MODEL。已尝试："
+        + "；".join(models_to_try)
+    )
 
 
 def _use_postgres() -> bool:
@@ -1045,7 +1076,8 @@ def suggest_term_candidate_translations(
         "只返回 JSON，格式："
         '{"items":[{"term":"英文术语","translation":"中文建议","confidence":"high|medium|low"}]}'
     )
-    msg = client.messages.create(
+    msg = _create_anthropic_message(
+        client,
         model=ANTHROPIC_MODEL,
         max_tokens=3072,
         temperature=0,
@@ -2493,7 +2525,8 @@ def translate_batch(client: anthropic.Anthropic, texts: list[str], glossary: dic
         '{"original": "原文2", "translated": "译文2"}], "unrecorded_terms": ["term1"]}'
     )
 
-    msg = client.messages.create(
+    msg = _create_anthropic_message(
+        client,
         model=ANTHROPIC_MODEL,
         max_tokens=4096,
         temperature=0,
@@ -2593,7 +2626,8 @@ def _force_translate(client: anthropic.Anthropic, text: str, glossary: dict) -> 
         "但不得以此为借口跳过其前后的英文单词，也必须原样保留文本中出现的所有数字。"
         "只返回中文翻译结果本身，不要输出 JSON、不要解释。"
     )
-    msg = client.messages.create(
+    msg = _create_anthropic_message(
+        client,
         model=ANTHROPIC_MODEL,
         max_tokens=512,
         system=_GARMENT_SYSTEM_PROMPT,
@@ -3050,7 +3084,8 @@ def translate_cell_text(client: anthropic.Anthropic, text: str, glossary: dict) 
         "禁止因为词很短或是操作指示句就原样保留英文，不允许返回结果与原文相同。\n"
         "5. 只返回翻译结果，不要任何解释或多余文字。"
     )
-    msg = client.messages.create(
+    msg = _create_anthropic_message(
+        client,
         model=ANTHROPIC_MODEL,
         max_tokens=512,
         system=_GARMENT_SYSTEM_PROMPT,
@@ -3280,7 +3315,8 @@ def _vision_extract_items(
         gloss_hint = f"\n参考术语对照（部分）：\n{sample}"
 
     try:
-        resp = client.messages.create(
+        resp = _create_anthropic_message(
+            client,
             model=ANTHROPIC_MODEL,
             max_tokens=2048,
             system=_GARMENT_SYSTEM_PROMPT,
