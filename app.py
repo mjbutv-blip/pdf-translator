@@ -1975,6 +1975,38 @@ def _normalize_header(value) -> str:
     return str(value).strip().lower().replace(" ", "_") if value is not None else ""
 
 
+def _rows_from_dataframe(df: pd.DataFrame) -> list[tuple]:
+    return [
+        tuple("" if pd.isna(value) else value for value in row)
+        for row in df.itertuples(index=False, name=None)
+    ]
+
+
+def _read_excel_sheet_rows(data: bytes, filename: str = "") -> tuple[list[tuple[str, list[tuple]]], str | None]:
+    ext = Path(filename or "").suffix.lower()
+    if ext == ".xls":
+        try:
+            sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, engine="xlrd")
+            return [(str(name), _rows_from_dataframe(df)) for name, df in sheets.items()], None
+        except Exception:
+            return [], "无法解析该文件，请确认上传的是有效的 Excel (.xls) 文件"
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        try:
+            return [
+                (ws.title, list(ws.iter_rows(values_only=True)))
+                for ws in wb.worksheets
+            ], None
+        finally:
+            wb.close()
+    except Exception:
+        try:
+            sheets = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, engine="xlrd")
+            return [(str(name), _rows_from_dataframe(df)) for name, df in sheets.items()], None
+        except Exception:
+            return [], "无法解析该文件，请确认上传的是有效的 Excel (.xlsx / .xls) 文件"
+
+
 def _find_glossary_header(rows: list[tuple]) -> tuple[int | None, int | None, int | None, int | None]:
     for row_idx, row in enumerate(rows[:30]):
         normalized = [_normalize_header(v) for v in row]
@@ -1992,15 +2024,14 @@ def _find_glossary_header(rows: list[tuple]) -> tuple[int | None, int | None, in
     return None, None, None, None
 
 
-def parse_customer_glossary_excel(data: bytes) -> tuple[pd.DataFrame | None, list[str], dict, list[dict]]:
+def parse_customer_glossary_excel(data: bytes, filename: str = "") -> tuple[pd.DataFrame | None, list[str], dict, list[dict]]:
     """Parse a customer glossary upload across all sheets.
     Supports common Chinese/English headers and returns a cleaned,
     case-insensitively de-duplicated dataframe plus import diagnostics.
     """
-    try:
-        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-    except Exception:
-        return None, ["无法解析该文件，请确认上传的是有效的 Excel (.xlsx) 文件"], {}, []
+    sheet_rows, parse_error = _read_excel_sheet_rows(data, filename)
+    if parse_error:
+        return None, [parse_error], {}, []
 
     records: list[dict] = []
     report_rows: list[dict] = []
@@ -2013,13 +2044,12 @@ def parse_customer_glossary_excel(data: bytes) -> tuple[pd.DataFrame | None, lis
         "sheets_without_header": 0,
     }
 
-    for ws in wb.worksheets:
-        rows = list(ws.iter_rows(values_only=True))
+    for sheet_name, rows in sheet_rows:
         header_idx, en_idx, zh_idx, note_idx = _find_glossary_header(rows)
         if header_idx is None:
             stats["sheets_without_header"] += 1
             report_rows.append({
-                "sheet_name": ws.title,
+                "sheet_name": sheet_name,
                 "row_number": "",
                 "english_term": "",
                 "chinese_translation": "",
@@ -2057,8 +2087,8 @@ def parse_customer_glossary_excel(data: bytes) -> tuple[pd.DataFrame | None, lis
                 _GLOSSARY_EN_COL: en,
                 _GLOSSARY_ZH_COL: zh,
                 _GLOSSARY_NOTE_COL: note,
-                _GLOSSARY_CAT_COL: ws.title,
-                "_sheet_name": ws.title,
+                _GLOSSARY_CAT_COL: sheet_name,
+                "_sheet_name": sheet_name,
                 "_row_number": row_number,
             })
             stats["valid_rows"] += 1
@@ -4111,13 +4141,13 @@ def render_customer_glossary_import_panel(
 
     uploaded = st.file_uploader(
         "上传术语库 Excel",
-        type=["xlsx"],
+        type=["xlsx", "xls"],
         key=f"{key_prefix}_glossary_upload",
     )
     if not uploaded:
         return
 
-    df, missing, parse_stats, parse_report = parse_customer_glossary_excel(uploaded.getvalue())
+    df, missing, parse_stats, parse_report = parse_customer_glossary_excel(uploaded.getvalue(), uploaded.name)
     if missing:
         st.error("；".join(missing))
         if parse_report:
