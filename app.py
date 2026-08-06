@@ -1811,6 +1811,9 @@ def render_login_panel() -> dict | None:
 def render_customer_selector(user: dict) -> str | None:
     accessible = get_accessible_customers(user)
     valid_ids = [c["customer_id"] for c in accessible]
+    pending_selected = st.session_state.pop("_pending_selected_customer_id", None)
+    if pending_selected in valid_ids:
+        st.session_state["selected_customer_id"] = pending_selected
     selected = st.session_state.get("selected_customer_id")
     if selected not in valid_ids:
         st.session_state.pop("selected_customer_id", None)
@@ -4936,7 +4939,7 @@ if tab_customer_admin is not None:
                             assigned_staff_username,
                             note,
                         )
-                        st.session_state["selected_customer_id"] = new_customer_id
+                        st.session_state["_pending_selected_customer_id"] = new_customer_id
                         st.success(f"已创建客户 {customer_code.strip()}，可立即在 PDF / Excel 翻译中选择。")
                         st.rerun()
                     except Exception as exc:
