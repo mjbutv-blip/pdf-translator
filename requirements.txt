@@ -6,3 +6,4 @@ openpyxl
 Pillow
 gspread
 google-auth
+psycopg[binary]
