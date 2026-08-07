@@ -4,10 +4,12 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime
+from uuid import uuid4
 
 import anthropic
 import fitz
@@ -212,6 +214,26 @@ def _postgres_create_schema(conn: DbConnection) -> None:
             submitted_at TEXT,
             UNIQUE(customer_id, normalized_term, status)
         );
+
+        CREATE TABLE IF NOT EXISTS translation_jobs (
+            job_id TEXT PRIMARY KEY,
+            job_type TEXT NOT NULL CHECK(job_type IN ('PDF', 'Excel')),
+            status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'complete', 'failed')),
+            username TEXT NOT NULL,
+            customer_id TEXT NOT NULL,
+            source_file_name TEXT NOT NULL,
+            progress DOUBLE PRECISION NOT NULL DEFAULT 0,
+            message TEXT DEFAULT '',
+            error TEXT DEFAULT '',
+            input_bytes BYTEA NOT NULL,
+            aux_bytes BYTEA,
+            result_file BYTEA,
+            result_report BYTEA,
+            result_meta TEXT DEFAULT '{}',
+            config TEXT DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         """
     )
     for sql in [
@@ -223,6 +245,9 @@ def _postgres_create_schema(conn: DbConnection) -> None:
         "ALTER TABLE term_candidates ADD COLUMN IF NOT EXISTS matched_by TEXT DEFAULT 'no_match'",
         "ALTER TABLE term_candidates ADD COLUMN IF NOT EXISTS matched_glossary_term TEXT DEFAULT ''",
         "ALTER TABLE term_candidates ADD COLUMN IF NOT EXISTS conflict_warning TEXT DEFAULT ''",
+        "ALTER TABLE translation_jobs ADD COLUMN IF NOT EXISTS aux_bytes BYTEA",
+        "ALTER TABLE translation_jobs ADD COLUMN IF NOT EXISTS result_meta TEXT DEFAULT '{}'",
+        "ALTER TABLE translation_jobs ADD COLUMN IF NOT EXISTS config TEXT DEFAULT '{}'",
     ]:
         conn.execute(sql)
 
@@ -356,6 +381,26 @@ def init_db() -> None:
                 submitted_at TEXT,
                 UNIQUE(customer_id, normalized_term, status)
             );
+
+            CREATE TABLE IF NOT EXISTS translation_jobs (
+                job_id TEXT PRIMARY KEY,
+                job_type TEXT NOT NULL CHECK(job_type IN ('PDF', 'Excel')),
+                status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'complete', 'failed')),
+                username TEXT NOT NULL,
+                customer_id TEXT NOT NULL,
+                source_file_name TEXT NOT NULL,
+                progress REAL NOT NULL DEFAULT 0,
+                message TEXT DEFAULT '',
+                error TEXT DEFAULT '',
+                input_bytes BLOB NOT NULL,
+                aux_bytes BLOB,
+                result_file BLOB,
+                result_report BLOB,
+                result_meta TEXT DEFAULT '{}',
+                config TEXT DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         existing_cols = {
@@ -410,6 +455,21 @@ def init_db() -> None:
             ("conflict_warning", "ALTER TABLE term_candidates ADD COLUMN conflict_warning TEXT DEFAULT ''"),
         ]:
             if col_name not in candidate_cols:
+                try:
+                    conn.execute(col_sql)
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc).lower():
+                        raise
+        job_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(translation_jobs)").fetchall()
+        }
+        for col_name, col_sql in [
+            ("aux_bytes", "ALTER TABLE translation_jobs ADD COLUMN aux_bytes BLOB"),
+            ("result_meta", "ALTER TABLE translation_jobs ADD COLUMN result_meta TEXT DEFAULT '{}'"),
+            ("config", "ALTER TABLE translation_jobs ADD COLUMN config TEXT DEFAULT '{}'"),
+        ]:
+            if col_name not in job_cols:
                 try:
                     conn.execute(col_sql)
                 except sqlite3.OperationalError as exc:
@@ -2552,6 +2612,37 @@ def translate_batch(client: anthropic.Anthropic, texts: list[str], glossary: dic
     return mapping, unrecorded
 
 
+def translate_batch_resilient(
+    client: anthropic.Anthropic,
+    texts: list[str],
+    glossary: dict,
+) -> tuple[dict[str, str], set[str]]:
+    """Translate a batch without letting malformed JSON kill the whole file.
+    It retries once, then recursively splits the batch, and finally falls back
+    to single-text plain translation.
+    """
+    texts = [t for t in texts if t.strip()]
+    if not texts:
+        return {}, set()
+    last_exc: Exception | None = None
+    for _ in range(2):
+        try:
+            return translate_batch(client, texts, glossary)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            last_exc = exc
+    if len(texts) > 1:
+        mid = max(1, len(texts) // 2)
+        left_map, left_terms = translate_batch_resilient(client, texts[:mid], glossary)
+        right_map, right_terms = translate_batch_resilient(client, texts[mid:], glossary)
+        return {**left_map, **right_map}, left_terms | right_terms
+    try:
+        return {texts[0]: _force_translate(client, texts[0], glossary)}, set()
+    except Exception:
+        if last_exc is not None:
+            raise last_exc
+        raise
+
+
 _RE_SIZE_LABEL       = re.compile(r'^(?:X{0,3}[SML]|\d?XL|XXL|XXXL)$', re.IGNORECASE)
 _RE_SINGLE_LETTER    = re.compile(r'^[A-Za-z]$')
 _RE_PURE_DIGIT_PUNCT = re.compile(r'^[\d\W_]+$')           # digits/punctuation only, no letters
@@ -2965,7 +3056,7 @@ def run_pdf_translation(
             texts = [b["clean_text"] for b in batch]
             on_block(f"批量翻译 {len(texts)} 项…")
             try:
-                mapping, unrecorded_batch = translate_batch(client, texts, glossary)
+                mapping, unrecorded_batch = translate_batch_resilient(client, texts, glossary)
                 all_unrecorded |= unrecorded_batch
                 for term in unrecorded_batch:
                     context = next(
@@ -3046,6 +3137,231 @@ def run_pdf_translation(
         )
 
     return pdf_buf.getvalue(), xlsx_buf.getvalue(), len(all_unrecorded)
+
+
+_RUNNING_JOB_THREADS: dict[str, threading.Thread] = {}
+
+
+def create_translation_job(
+    job_type: str,
+    username: str,
+    customer_id: str,
+    source_file_name: str,
+    input_bytes: bytes,
+    aux_bytes: bytes | None,
+    config: dict,
+) -> str:
+    job_id = str(uuid4())
+    now = _now_iso()
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO translation_jobs (
+                job_id, job_type, status, username, customer_id, source_file_name,
+                progress, message, input_bytes, aux_bytes, config, created_at, updated_at
+            )
+            VALUES (?, ?, 'queued', ?, ?, ?, 0, '等待开始', ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                job_type,
+                username,
+                customer_id,
+                source_file_name,
+                input_bytes,
+                aux_bytes,
+                json.dumps(config, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+    return job_id
+
+
+def update_translation_job(job_id: str, **fields) -> None:
+    if not fields:
+        return
+    fields["updated_at"] = _now_iso()
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    values = list(fields.values()) + [job_id]
+    with get_db_connection() as conn:
+        conn.execute(
+            f"UPDATE translation_jobs SET {assignments} WHERE job_id = ?",
+            values,
+        )
+
+
+def list_translation_jobs(username: str, job_type: str = "PDF", limit: int = 20) -> list[dict]:
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT job_id, job_type, status, username, customer_id, source_file_name,
+                   progress, message, error, result_meta, created_at, updated_at
+            FROM translation_jobs
+            WHERE username = ? AND job_type = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (username, job_type, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_translation_job(job_id: str, username: str) -> dict | None:
+    with get_db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM translation_jobs
+            WHERE job_id = ? AND username = ?
+            """,
+            (job_id, username),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def _pdf_scope_report_rows(file_name: str, scope_cfg: dict, selected_pages, scope_detection, scope_mode: str) -> list[dict]:
+    selected_page_nums = [
+        pn + 1 for pn in (selected_pages or [])
+    ] if selected_pages is not None else list(range(1, int(scope_cfg.get("total_pages", 0)) + 1))
+    detection_by_page = {
+        row.get("page_number"): row for row in (scope_detection or [])
+    }
+    total_pages = int(scope_cfg.get("total_pages") or len(detection_by_page) or 0)
+    rows = []
+    if total_pages:
+        selected_set = set(selected_page_nums)
+        for page_number in range(1, total_pages + 1):
+            det = detection_by_page.get(page_number, {})
+            rows.append({
+                "file_name": file_name,
+                "source_type": "PDF",
+                "scope_mode": scope_mode,
+                "item": f"第 {page_number} 页",
+                "selected": page_number in selected_set,
+                "score": det.get("score", ""),
+                "reason": det.get("reason", ""),
+            })
+    return rows
+
+
+def _run_pdf_translation_job(job_id: str, api_key: str) -> None:
+    job = None
+    try:
+        with get_db_connection() as conn:
+            row = conn.execute("SELECT * FROM translation_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        if row is None:
+            return
+        job = dict(row)
+        config = json.loads(job.get("config") or "{}")
+        update_translation_job(job_id, status="running", progress=0.01, message="正在准备翻译")
+
+        font_bytes = job.get("aux_bytes")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            if font_bytes:
+                font_path = os.path.join(tmpdir, "font.ttf")
+                with open(font_path, "wb") as f:
+                    f.write(font_bytes)
+            else:
+                font_path = str(DEFAULT_FONT)
+
+            glossary_bytes = get_customer_glossary_bytes_for_translation(
+                {"username": job["username"], "role": "company_admin"},
+                job["customer_id"],
+            )
+
+            def on_page(pn, total, n_blocks):
+                update_translation_job(
+                    job_id,
+                    message=f"第 {pn + 1}/{total} 页，{n_blocks} 个文本块",
+                )
+
+            def on_block(preview):
+                update_translation_job(job_id, message=str(preview)[:180])
+
+            def on_progress(frac):
+                update_translation_job(job_id, progress=max(0.0, min(float(frac), 1.0)))
+
+            selected_pages = config.get("selected_pages")
+            scope_detection = config.get("scope_detection") or []
+            scope_cfg = config.get("scope_cfg") or {}
+            scope_mode = config.get("scope_mode") or "all"
+            pdf_out, xlsx_out, n_terms = run_pdf_translation(
+                pdf_bytes=job["input_bytes"],
+                glossary_bytes=glossary_bytes,
+                font_path=font_path,
+                api_key=api_key,
+                on_page=on_page,
+                on_block=on_block,
+                on_progress=on_progress,
+                customer_id=job["customer_id"],
+                source_file_name=job["source_file_name"],
+                created_by=job["username"],
+                selected_pages=selected_pages,
+                scope_mode=scope_mode,
+                scope_detection=scope_detection,
+            )
+            scope_report = _pdf_scope_report_rows(
+                job["source_file_name"],
+                scope_cfg,
+                selected_pages,
+                scope_detection,
+                scope_mode,
+            )
+            scope_report_bytes = build_scope_report_xlsx(scope_report) if scope_report else b""
+            report_bytes = b""
+            report_kind = ""
+            if xlsx_out and scope_report_bytes:
+                report_zip = io.BytesIO()
+                with zipfile.ZipFile(report_zip, "w") as zf:
+                    zf.writestr("unrecorded_terms.xlsx", xlsx_out)
+                    zf.writestr("scope_report.xlsx", scope_report_bytes)
+                report_bytes = report_zip.getvalue()
+                report_kind = "zip"
+            elif xlsx_out:
+                report_bytes = xlsx_out
+                report_kind = "unrecorded"
+            elif scope_report_bytes:
+                report_bytes = scope_report_bytes
+                report_kind = "scope"
+            update_translation_job(
+                job_id,
+                status="complete",
+                progress=1.0,
+                message="翻译完成",
+                result_file=pdf_out,
+                result_report=report_bytes,
+                result_meta=json.dumps(
+                    {
+                        "n_terms": n_terms,
+                        "has_scope_report": bool(scope_report),
+                        "has_unrecorded_terms": bool(xlsx_out),
+                        "report_kind": report_kind,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+    except Exception as exc:
+        update_translation_job(
+            job_id,
+            status="failed",
+            error=str(exc),
+            message="翻译失败",
+        )
+    finally:
+        _RUNNING_JOB_THREADS.pop(job_id, None)
+
+
+def start_pdf_translation_job(job_id: str, api_key: str) -> None:
+    if job_id in _RUNNING_JOB_THREADS and _RUNNING_JOB_THREADS[job_id].is_alive():
+        return
+    thread = threading.Thread(
+        target=_run_pdf_translation_job,
+        args=(job_id, api_key),
+        daemon=True,
+    )
+    _RUNNING_JOB_THREADS[job_id] = thread
+    thread.start()
 
 
 # ── Excel translation ──────────────────────────────────────────────────────────
@@ -3941,106 +4257,82 @@ with tab_pdf:
     )
 
     if start_pdf_btn:
-        st.session_state["pdf_batch_results"] = []
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            if font_file:
-                fp = os.path.join(tmpdir, "font.ttf")
-                with open(fp, "wb") as f:
-                    f.write(font_file.read())
-                font_path = fp
-            else:
-                font_path = str(DEFAULT_FONT)
-
-            glossary_bytes = get_customer_glossary_bytes_for_translation(
-                current_user,
-                selected_customer_id,
+        created_jobs = []
+        font_bytes = font_file.getvalue() if font_file else None
+        for pf in pdf_files:
+            pdf_input_bytes = pf.getvalue()
+            scope_cfg = pdf_scope_configs.get(pf.name, {})
+            if pdf_scope_choice == "all":
+                doc_for_count = fitz.open(stream=pdf_input_bytes, filetype="pdf")
+                scope_cfg = {"total_pages": len(doc_for_count), "detection": []}
+                doc_for_count.close()
+            selected_pages = None if pdf_scope_choice == "all" else scope_cfg.get("selected_pages")
+            scope_detection = scope_cfg.get("detection") if pdf_scope_choice != "all" else []
+            job_id = create_translation_job(
+                job_type="PDF",
+                username=current_user["username"],
+                customer_id=selected_customer_id,
+                source_file_name=pf.name,
+                input_bytes=pdf_input_bytes,
+                aux_bytes=font_bytes,
+                config={
+                    "scope_mode": pdf_scope_choice,
+                    "selected_pages": selected_pages,
+                    "scope_detection": scope_detection,
+                    "scope_cfg": scope_cfg,
+                },
             )
+            start_pdf_translation_job(job_id, api_key)
+            created_jobs.append(job_id)
+        st.session_state["last_pdf_job_ids"] = created_jobs
+        st.success(f"已创建 **{len(created_jobs)}** 个后台翻译任务。可以切换页面，稍后回到本页下载结果。")
 
-            overall = st.progress(0.0, text=f"准备处理 {len(pdf_files)} 个文件…")
-            results = []
-
-            for fi, pf in enumerate(pdf_files):
-                with st.status(f"正在处理：{pf.name}", expanded=True) as status:
-                    block_ph = st.empty()
-                    file_prog = st.progress(0.0)
-
-                    def on_page(pn, total, n_blocks):
-                        st.write(f"**── 第 {pn + 1} / {total} 页**　（{n_blocks} 个文本块）")
-
-                    def on_block(preview):
-                        block_ph.caption(f"▶ 正在翻译：{preview}…")
-
-                    def on_progress(frac):
-                        file_prog.progress(frac, text=f"翻译进度 {frac:.0%}")
-
-                    try:
-                        pdf_input_bytes = pf.getvalue()
-                        scope_cfg = pdf_scope_configs.get(pf.name, {})
-                        if pdf_scope_choice == "all":
-                            doc_for_count = fitz.open(stream=pdf_input_bytes, filetype="pdf")
-                            scope_cfg = {"total_pages": len(doc_for_count), "detection": []}
-                            doc_for_count.close()
-                        selected_pages = None if pdf_scope_choice == "all" else scope_cfg.get("selected_pages")
-                        scope_detection = scope_cfg.get("detection") if pdf_scope_choice != "all" else []
-                        pdf_out, xlsx_out, n_terms = run_pdf_translation(
-                            pdf_bytes=pdf_input_bytes,
-                            glossary_bytes=glossary_bytes,
-                            font_path=font_path,
-                            api_key=api_key,
-                            on_page=on_page,
-                            on_block=on_block,
-                            on_progress=on_progress,
-                            customer_id=selected_customer_id,
-                            source_file_name=pf.name,
-                            created_by=current_user["username"],
-                            selected_pages=selected_pages,
-                            scope_mode=pdf_scope_choice,
-                            scope_detection=scope_detection,
-                        )
-                        selected_page_nums = [
-                            pn + 1 for pn in (selected_pages or [])
-                        ] if selected_pages is not None else list(range(1, scope_cfg.get("total_pages", 0) + 1))
-                        detection_by_page = {
-                            row.get("page_number"): row for row in (scope_detection or [])
-                        }
-                        total_pages = scope_cfg.get("total_pages") or len(detection_by_page)
-                        scope_report_rows = []
-                        if total_pages:
-                            selected_set = set(selected_page_nums)
-                            for page_number in range(1, total_pages + 1):
-                                det = detection_by_page.get(page_number, {})
-                                scope_report_rows.append({
-                                    "file_name": pf.name,
-                                    "source_type": "PDF",
-                                    "scope_mode": pdf_scope_choice,
-                                    "item": f"第 {page_number} 页",
-                                    "selected": page_number in selected_set,
-                                    "score": det.get("score", ""),
-                                    "reason": det.get("reason", ""),
-                                })
-                        block_ph.empty()
-                        status.update(label=f"✅ {pf.name} 翻译完成", state="complete")
-                        results.append({
-                            "name": pf.name,
-                            "ok": True,
-                            "pdf": pdf_out,
-                            "xlsx": xlsx_out,
-                            "n_terms": n_terms,
-                            "scope_report": scope_report_rows,
-                        })
-                    except Exception as e:
-                        block_ph.empty()
-                        status.update(label=f"❌ {pf.name} 出错：{e}", state="error")
-                        results.append({
-                            "name": pf.name,
-                            "ok": False,
-                            "error": str(e),
-                        })
-
-                overall.progress((fi + 1) / len(pdf_files), text=f"已完成 {fi + 1}/{len(pdf_files)}")
-
-            st.session_state["pdf_batch_results"] = results
+    pdf_jobs = list_translation_jobs(current_user["username"], "PDF") if current_user else []
+    if pdf_jobs:
+        st.divider()
+        st.subheader("PDF 后台任务")
+        if st.button("刷新任务状态", use_container_width=True, key="refresh_pdf_jobs_btn"):
+            st.rerun()
+        for job in pdf_jobs:
+            label = {
+                "queued": "等待中",
+                "running": "翻译中",
+                "complete": "已完成",
+                "failed": "失败",
+            }.get(job["status"], job["status"])
+            with st.expander(f"{label} · {job['source_file_name']} · {job['updated_at']}", expanded=job["status"] in {"running", "failed"}):
+                st.progress(float(job.get("progress") or 0), text=job.get("message") or label)
+                if job.get("error"):
+                    st.error(job["error"])
+                if job["status"] == "complete":
+                    full_job = get_translation_job(job["job_id"], current_user["username"])
+                    if full_job:
+                        meta = json.loads(full_job.get("result_meta") or "{}")
+                        base = full_job["source_file_name"].rsplit(".", 1)[0]
+                        st.caption(f"未收录术语：{meta.get('n_terms', 0)} 条")
+                        dl_cols = st.columns(2)
+                        with dl_cols[0]:
+                            st.download_button(
+                                "⬇️ 下载中文 PDF",
+                                data=full_job["result_file"],
+                                file_name=f"{base}_translated.pdf",
+                                mime="application/pdf",
+                                use_container_width=True,
+                                key=f"job_pdf_dl_{job['job_id']}",
+                            )
+                        with dl_cols[1]:
+                            if full_job.get("result_report"):
+                                report_kind = meta.get("report_kind") or "xlsx"
+                                report_ext = "zip" if report_kind == "zip" else "xlsx"
+                                report_mime = "application/zip" if report_kind == "zip" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                st.download_button(
+                                    "⬇️ 下载报告",
+                                    data=full_job["result_report"],
+                                    file_name=f"{base}_report.{report_ext}",
+                                    mime=report_mime,
+                                    use_container_width=True,
+                                    key=f"job_pdf_report_dl_{job['job_id']}",
+                                )
 
     batch_results = st.session_state.get("pdf_batch_results", [])
     if batch_results:
