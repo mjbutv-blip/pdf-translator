@@ -3276,6 +3276,24 @@ def delete_translation_job(job_id: str, username: str) -> None:
         )
 
 
+def get_next_queued_pdf_job(username: str, exclude_job_id: str = "") -> dict | None:
+    with get_db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT job_id
+            FROM translation_jobs
+            WHERE username = ?
+              AND job_type = 'PDF'
+              AND status = 'queued'
+              AND job_id <> ?
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            (username, exclude_job_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def _pdf_scope_report_rows(file_name: str, scope_cfg: dict, selected_pages, scope_detection, scope_mode: str) -> list[dict]:
     selected_page_nums = [
         pn + 1 for pn in (selected_pages or [])
@@ -3301,7 +3319,7 @@ def _pdf_scope_report_rows(file_name: str, scope_cfg: dict, selected_pages, scop
     return rows
 
 
-def _run_pdf_translation_job(job_id: str, api_key: str) -> None:
+def _run_pdf_translation_job(job_id: str, api_key: str, start_next_on_finish: bool = False) -> None:
     job = None
     try:
         with get_db_connection() as conn:
@@ -3416,14 +3434,22 @@ def _run_pdf_translation_job(job_id: str, api_key: str) -> None:
         )
     finally:
         _RUNNING_JOB_THREADS.pop(job_id, None)
+        if start_next_on_finish and job:
+            next_job = get_next_queued_pdf_job(job["username"], exclude_job_id=job_id)
+            if next_job:
+                start_pdf_translation_job(
+                    next_job["job_id"],
+                    api_key,
+                    start_next_on_finish=True,
+                )
 
 
-def start_pdf_translation_job(job_id: str, api_key: str) -> bool:
+def start_pdf_translation_job(job_id: str, api_key: str, start_next_on_finish: bool = False) -> bool:
     if job_id in _RUNNING_JOB_THREADS and _RUNNING_JOB_THREADS[job_id].is_alive():
         return False
     thread = threading.Thread(
         target=_run_pdf_translation_job,
-        args=(job_id, api_key),
+        args=(job_id, api_key, start_next_on_finish),
         daemon=True,
     )
     _RUNNING_JOB_THREADS[job_id] = thread
@@ -4347,12 +4373,24 @@ with tab_pdf:
                     "scope_cfg": scope_cfg,
                 },
             )
-            start_pdf_translation_job(job_id, api_key)
             created_jobs.append(job_id)
+        if created_jobs:
+            start_pdf_translation_job(created_jobs[0], api_key, start_next_on_finish=True)
         st.session_state["last_pdf_job_ids"] = created_jobs
         st.success(f"已创建 **{len(created_jobs)}** 个后台翻译任务。可以切换页面，稍后回到本页下载结果。")
 
     pdf_jobs = list_translation_jobs(current_user["username"], "PDF") if current_user else []
+    if pdf_jobs and api_key:
+        has_active_pdf_thread = any(thread.is_alive() for thread in _RUNNING_JOB_THREADS.values())
+        has_running_pdf_job = any(job["status"] == "running" for job in pdf_jobs)
+        queued_pdf_job = next((job for job in reversed(pdf_jobs) if job["status"] == "queued"), None)
+        if queued_pdf_job and not has_active_pdf_thread and not has_running_pdf_job:
+            start_pdf_translation_job(
+                queued_pdf_job["job_id"],
+                api_key,
+                start_next_on_finish=True,
+            )
+            st.rerun()
     if pdf_jobs:
         st.divider()
         st.subheader("PDF 后台任务")
@@ -4361,7 +4399,7 @@ with tab_pdf:
             components.html(
                 """
                 <script>
-                setTimeout(() => window.parent.location.reload(), 3000);
+                setTimeout(() => window.parent.location.reload(), 8000);
                 </script>
                 """,
                 height=0,
@@ -4388,7 +4426,11 @@ with tab_pdf:
                         use_container_width=True,
                         key=f"restart_pdf_job_{job['job_id']}",
                     ):
-                        restarted = start_pdf_translation_job(job["job_id"], api_key)
+                        restarted = start_pdf_translation_job(
+                            job["job_id"],
+                            api_key,
+                            start_next_on_finish=True,
+                        )
                         if restarted:
                             st.success("已重新启动任务。")
                         else:
