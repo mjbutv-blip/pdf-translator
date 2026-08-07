@@ -520,6 +520,14 @@ def init_db() -> None:
             )
 
 
+@st.cache_resource(show_spinner=False)
+def run_startup_tasks_once(use_postgres_marker: bool, schema_version: int) -> bool:
+    init_db()
+    seed_demo_data_if_empty()
+    sync_staff_customer_assignments()
+    return True
+
+
 def seed_demo_data_if_empty() -> None:
     with get_db_connection() as conn:
         exists = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
@@ -4168,9 +4176,7 @@ st.title("🧵 服装行业翻译引擎")
 st.caption("支持 PDF 与 Excel (.xlsx) 双格式 · 上传文件 + 术语库 · 调用 Claude 自动翻译为中文")
 st.divider()
 
-init_db()
-seed_demo_data_if_empty()
-sync_staff_customer_assignments()
+run_startup_tasks_once(_use_postgres(), 1)
 current_user = render_login_panel()
 if not current_user:
     st.stop()
