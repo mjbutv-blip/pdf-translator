@@ -2879,7 +2879,7 @@ def _short_label_score(lines: list[str]) -> int:
     return 0
 
 
-def _is_label_or_packaging_page(text: str, lines: list[str], image_count: int) -> tuple[bool, str]:
+def _is_label_or_packaging_page(text: str, lines: list[str], image_count: int, positive_score: int) -> tuple[bool, str]:
     lowered = " ".join(lines).lower()
     forced_terms = [
         "care label",
@@ -2900,14 +2900,11 @@ def _is_label_or_packaging_page(text: str, lines: list[str], image_count: int) -
         if term in lowered:
             return True, term
 
-    if ("front" in lowered and "back" in lowered) or ("vorderseite" in lowered and "rückseite" in lowered):
+    if positive_score == 0 and (("front" in lowered and "back" in lowered) or ("vorderseite" in lowered and "rückseite" in lowered)):
         return True, "front/back layout"
 
-    if image_count >= 2 and len(lines) <= 25:
-        return True, "多图少正文"
-
-    if _short_label_score(lines) >= 2:
-        return True, "短标注过多"
+    if positive_score == 0 and image_count >= 2 and len(lines) <= 18 and _short_label_score(lines) >= 2:
+        return True, "多图少正文且短标注过多"
 
     return False, ""
 
@@ -2931,8 +2928,8 @@ def detect_workmanship_pages(pdf_bytes: bytes) -> list[dict]:
                 "sketch": 5,
             })
             label_score = _short_label_score(lines)
-            forced_non_workmanship, forced_reason = _is_label_or_packaging_page(text, lines, image_count)
-            image_bonus = 2 if image_count >= 1 and (pos_score + title_bonus) > 0 else 0
+            forced_non_workmanship, forced_reason = _is_label_or_packaging_page(text, lines, image_count, pos_score + title_bonus)
+            image_bonus = 1 if image_count >= 1 and (pos_score + title_bonus) > 0 else 0
             score = pos_score + title_bonus + label_score + image_bonus - neg_score
             if forced_non_workmanship:
                 is_workmanship = False
