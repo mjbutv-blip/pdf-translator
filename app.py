@@ -50,7 +50,7 @@ def _database_url() -> str:
 
 
 ANTHROPIC_MODEL = _secret_or_env("ANTHROPIC_MODEL", ANTHROPIC_MODEL)
-ANTHROPIC_TIMEOUT_SECONDS = max(20, _int_secret_or_env("ANTHROPIC_TIMEOUT_SECONDS", 90))
+ANTHROPIC_TIMEOUT_SECONDS = max(20, _int_secret_or_env("ANTHROPIC_TIMEOUT_SECONDS", 45))
 ANTHROPIC_FALLBACK_MODELS = [
     model.strip()
     for model in _secret_or_env(
@@ -2528,7 +2528,7 @@ _GARMENT_SYSTEM_PROMPT = (
 )
 
 
-_MAX_BATCH_ITEMS = max(5, _int_secret_or_env("PDF_TRANSLATION_BATCH_SIZE", 12))
+_MAX_BATCH_ITEMS = max(3, _int_secret_or_env("PDF_TRANSLATION_BATCH_SIZE", 6))
 
 
 def _chunk(items: list, n: int) -> list[list]:
@@ -2657,20 +2657,17 @@ def translate_batch_resilient(
     glossary: dict,
 ) -> tuple[dict[str, str], set[str]]:
     """Translate a batch without letting malformed JSON kill the whole file.
-    It retries once, then recursively splits the batch, and finally falls back
-    to single-text plain translation.
+    It tries the batch once, recursively splits on retryable failures, and
+    finally preserves a single original text if even the fallback call fails.
     """
     texts = [t for t in texts if t.strip()]
     if not texts:
         return {}, set()
-    last_exc: Exception | None = None
-    for _ in range(2):
-        try:
-            return translate_batch(client, texts, glossary)
-        except Exception as exc:
-            if not _is_retryable_batch_error(exc):
-                raise
-            last_exc = exc
+    try:
+        return translate_batch(client, texts, glossary)
+    except Exception as exc:
+        if not _is_retryable_batch_error(exc):
+            raise
     if len(texts) > 1:
         mid = max(1, len(texts) // 2)
         left_map, left_terms = translate_batch_resilient(client, texts[:mid], glossary)
@@ -2678,10 +2675,9 @@ def translate_batch_resilient(
         return {**left_map, **right_map}, left_terms | right_terms
     try:
         return {texts[0]: _force_translate(client, texts[0], glossary)}, set()
-    except Exception:
-        if last_exc is not None:
-            raise last_exc
-        raise
+    except Exception as exc:
+        print(f"单条批量翻译失败，保留原文继续：{texts[0][:80]}；错误：{exc}")
+        return {texts[0]: texts[0]}, set()
 
 
 _RE_SIZE_LABEL       = re.compile(r'^(?:X{0,3}[SML]|\d?XL|XXL|XXXL)$', re.IGNORECASE)
