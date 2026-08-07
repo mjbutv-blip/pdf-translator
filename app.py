@@ -38,11 +38,19 @@ def _secret_or_env(name: str, default: str = "") -> str:
         return default
 
 
+def _int_secret_or_env(name: str, default: int) -> int:
+    try:
+        return int(_secret_or_env(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _database_url() -> str:
     return _secret_or_env("DATABASE_URL", "").strip()
 
 
 ANTHROPIC_MODEL = _secret_or_env("ANTHROPIC_MODEL", ANTHROPIC_MODEL)
+ANTHROPIC_TIMEOUT_SECONDS = max(20, _int_secret_or_env("ANTHROPIC_TIMEOUT_SECONDS", 90))
 ANTHROPIC_FALLBACK_MODELS = [
     model.strip()
     for model in _secret_or_env(
@@ -61,6 +69,7 @@ def _model_not_found_error(exc: Exception) -> bool:
 
 def _create_anthropic_message(client: anthropic.Anthropic, **kwargs):
     requested_model = kwargs.pop("model", ANTHROPIC_MODEL)
+    kwargs.setdefault("timeout", ANTHROPIC_TIMEOUT_SECONDS)
     models_to_try = list(dict.fromkeys([requested_model, *ANTHROPIC_FALLBACK_MODELS]))
     for model in models_to_try:
         try:
@@ -2519,7 +2528,7 @@ _GARMENT_SYSTEM_PROMPT = (
 )
 
 
-_MAX_BATCH_ITEMS = 30
+_MAX_BATCH_ITEMS = max(5, _int_secret_or_env("PDF_TRANSLATION_BATCH_SIZE", 12))
 
 
 def _chunk(items: list, n: int) -> list[list]:
@@ -2632,6 +2641,16 @@ def translate_batch(client: anthropic.Anthropic, texts: list[str], glossary: dic
     return mapping, unrecorded
 
 
+def _is_retryable_batch_error(exc: Exception) -> bool:
+    if isinstance(exc, (json.JSONDecodeError, KeyError, TypeError, ValueError)):
+        return True
+    status_code = getattr(exc, "status_code", None)
+    if status_code in {408, 409, 429, 500, 502, 503, 504}:
+        return True
+    err_name = type(exc).__name__.lower()
+    return "timeout" in err_name or "connection" in err_name
+
+
 def translate_batch_resilient(
     client: anthropic.Anthropic,
     texts: list[str],
@@ -2648,7 +2667,9 @@ def translate_batch_resilient(
     for _ in range(2):
         try:
             return translate_batch(client, texts, glossary)
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        except Exception as exc:
+            if not _is_retryable_batch_error(exc):
+                raise
             last_exc = exc
     if len(texts) > 1:
         mid = max(1, len(texts) // 2)
@@ -3384,9 +3405,9 @@ def _run_pdf_translation_job(job_id: str, api_key: str) -> None:
         _RUNNING_JOB_THREADS.pop(job_id, None)
 
 
-def start_pdf_translation_job(job_id: str, api_key: str) -> None:
+def start_pdf_translation_job(job_id: str, api_key: str) -> bool:
     if job_id in _RUNNING_JOB_THREADS and _RUNNING_JOB_THREADS[job_id].is_alive():
-        return
+        return False
     thread = threading.Thread(
         target=_run_pdf_translation_job,
         args=(job_id, api_key),
@@ -3394,6 +3415,7 @@ def start_pdf_translation_job(job_id: str, api_key: str) -> None:
     )
     _RUNNING_JOB_THREADS[job_id] = thread
     thread.start()
+    return True
 
 
 # ── Excel translation ──────────────────────────────────────────────────────────
@@ -4336,6 +4358,19 @@ with tab_pdf:
                 st.progress(float(job.get("progress") or 0), text=job.get("message") or label)
                 if job.get("error"):
                     st.error(job["error"])
+                if job["status"] == "running":
+                    st.caption("如果进度长时间不动，可以重新启动这个后台任务。")
+                    if st.button(
+                        "重新启动任务",
+                        use_container_width=True,
+                        key=f"restart_pdf_job_{job['job_id']}",
+                    ):
+                        restarted = start_pdf_translation_job(job["job_id"], api_key)
+                        if restarted:
+                            st.success("已重新启动任务。")
+                        else:
+                            st.info("任务线程仍在运行，请稍后刷新查看。")
+                        st.rerun()
                 if job["status"] == "complete":
                     full_job = get_translation_job(job["job_id"], current_user["username"])
                     if full_job:
