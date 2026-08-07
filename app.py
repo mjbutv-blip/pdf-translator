@@ -17,7 +17,6 @@ import fitz
 import openpyxl
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
@@ -3457,6 +3456,88 @@ def start_pdf_translation_job(job_id: str, api_key: str, start_next_on_finish: b
     return True
 
 
+@st.fragment(run_every=8)
+def render_pdf_jobs_panel(current_user: dict, api_key: str) -> None:
+    pdf_jobs = list_translation_jobs(current_user["username"], "PDF") if current_user else []
+    if pdf_jobs and api_key:
+        has_active_pdf_thread = any(thread.is_alive() for thread in _RUNNING_JOB_THREADS.values())
+        has_running_pdf_job = any(job["status"] == "running" for job in pdf_jobs)
+        queued_pdf_job = next((job for job in reversed(pdf_jobs) if job["status"] == "queued"), None)
+        if queued_pdf_job and not has_active_pdf_thread and not has_running_pdf_job:
+            start_pdf_translation_job(
+                queued_pdf_job["job_id"],
+                api_key,
+                start_next_on_finish=True,
+            )
+            st.rerun(scope="fragment")
+    if not pdf_jobs:
+        return
+
+    st.divider()
+    st.subheader("PDF 后台任务")
+    if st.button("刷新任务状态", use_container_width=True, key="refresh_pdf_jobs_btn"):
+        st.rerun(scope="fragment")
+    for job in pdf_jobs:
+        label = {
+            "queued": "等待中",
+            "running": "翻译中",
+            "complete": "已完成",
+            "failed": "失败",
+        }.get(job["status"], job["status"])
+        with st.expander(f"{label} · {job['source_file_name']} · {job['updated_at']}", expanded=job["status"] in {"running", "failed"}):
+            st.progress(float(job.get("progress") or 0), text=job.get("message") or label)
+            if job.get("error"):
+                st.error(job["error"])
+            if job["status"] == "failed":
+                delete_translation_job(job["job_id"], current_user["username"])
+            if job["status"] == "running":
+                st.caption("如果进度长时间不动，可以重新启动这个后台任务。")
+                if st.button(
+                    "重新启动任务",
+                    use_container_width=True,
+                    key=f"restart_pdf_job_{job['job_id']}",
+                ):
+                    restarted = start_pdf_translation_job(
+                        job["job_id"],
+                        api_key,
+                        start_next_on_finish=True,
+                    )
+                    if restarted:
+                        st.success("已重新启动任务。")
+                    else:
+                        st.info("任务线程仍在运行，请稍后刷新查看。")
+                    st.rerun(scope="fragment")
+            if job["status"] == "complete":
+                full_job = get_translation_job(job["job_id"], current_user["username"])
+                if full_job:
+                    meta = json.loads(full_job.get("result_meta") or "{}")
+                    base = full_job["source_file_name"].rsplit(".", 1)[0]
+                    st.caption(f"未收录术语：{meta.get('n_terms', 0)} 条")
+                    dl_cols = st.columns(2)
+                    with dl_cols[0]:
+                        st.download_button(
+                            "⬇️ 下载中文 PDF",
+                            data=full_job["result_file"],
+                            file_name=f"{base}_translated.pdf",
+                            mime="application/pdf",
+                            use_container_width=True,
+                            key=f"job_pdf_dl_{job['job_id']}",
+                        )
+                    with dl_cols[1]:
+                        if full_job.get("result_report"):
+                            report_kind = meta.get("report_kind") or "xlsx"
+                            report_ext = "zip" if report_kind == "zip" else "xlsx"
+                            report_mime = "application/zip" if report_kind == "zip" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            st.download_button(
+                                "⬇️ 下载报告",
+                                data=full_job["result_report"],
+                                file_name=f"{base}_report.{report_ext}",
+                                mime=report_mime,
+                                use_container_width=True,
+                                key=f"job_pdf_report_dl_{job['job_id']}",
+                            )
+
+
 # ── Excel translation ──────────────────────────────────────────────────────────
 
 def _is_translatable(val) -> bool:
@@ -4379,92 +4460,7 @@ with tab_pdf:
         st.session_state["last_pdf_job_ids"] = created_jobs
         st.success(f"已创建 **{len(created_jobs)}** 个后台翻译任务。可以切换页面，稍后回到本页下载结果。")
 
-    pdf_jobs = list_translation_jobs(current_user["username"], "PDF") if current_user else []
-    if pdf_jobs and api_key:
-        has_active_pdf_thread = any(thread.is_alive() for thread in _RUNNING_JOB_THREADS.values())
-        has_running_pdf_job = any(job["status"] == "running" for job in pdf_jobs)
-        queued_pdf_job = next((job for job in reversed(pdf_jobs) if job["status"] == "queued"), None)
-        if queued_pdf_job and not has_active_pdf_thread and not has_running_pdf_job:
-            start_pdf_translation_job(
-                queued_pdf_job["job_id"],
-                api_key,
-                start_next_on_finish=True,
-            )
-            st.rerun()
-    if pdf_jobs:
-        st.divider()
-        st.subheader("PDF 后台任务")
-        auto_refresh_jobs = any(job["status"] in {"queued", "running"} for job in pdf_jobs)
-        if auto_refresh_jobs:
-            components.html(
-                """
-                <script>
-                setTimeout(() => window.parent.location.reload(), 8000);
-                </script>
-                """,
-                height=0,
-            )
-        if st.button("刷新任务状态", use_container_width=True, key="refresh_pdf_jobs_btn"):
-            st.rerun()
-        for job in pdf_jobs:
-            label = {
-                "queued": "等待中",
-                "running": "翻译中",
-                "complete": "已完成",
-                "failed": "失败",
-            }.get(job["status"], job["status"])
-            with st.expander(f"{label} · {job['source_file_name']} · {job['updated_at']}", expanded=job["status"] in {"running", "failed"}):
-                st.progress(float(job.get("progress") or 0), text=job.get("message") or label)
-                if job.get("error"):
-                    st.error(job["error"])
-                if job["status"] == "failed":
-                    delete_translation_job(job["job_id"], current_user["username"])
-                if job["status"] == "running":
-                    st.caption("如果进度长时间不动，可以重新启动这个后台任务。")
-                    if st.button(
-                        "重新启动任务",
-                        use_container_width=True,
-                        key=f"restart_pdf_job_{job['job_id']}",
-                    ):
-                        restarted = start_pdf_translation_job(
-                            job["job_id"],
-                            api_key,
-                            start_next_on_finish=True,
-                        )
-                        if restarted:
-                            st.success("已重新启动任务。")
-                        else:
-                            st.info("任务线程仍在运行，请稍后刷新查看。")
-                        st.rerun()
-                if job["status"] == "complete":
-                    full_job = get_translation_job(job["job_id"], current_user["username"])
-                    if full_job:
-                        meta = json.loads(full_job.get("result_meta") or "{}")
-                        base = full_job["source_file_name"].rsplit(".", 1)[0]
-                        st.caption(f"未收录术语：{meta.get('n_terms', 0)} 条")
-                        dl_cols = st.columns(2)
-                        with dl_cols[0]:
-                            st.download_button(
-                                "⬇️ 下载中文 PDF",
-                                data=full_job["result_file"],
-                                file_name=f"{base}_translated.pdf",
-                                mime="application/pdf",
-                                use_container_width=True,
-                                key=f"job_pdf_dl_{job['job_id']}",
-                            )
-                        with dl_cols[1]:
-                            if full_job.get("result_report"):
-                                report_kind = meta.get("report_kind") or "xlsx"
-                                report_ext = "zip" if report_kind == "zip" else "xlsx"
-                                report_mime = "application/zip" if report_kind == "zip" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                                st.download_button(
-                                    "⬇️ 下载报告",
-                                    data=full_job["result_report"],
-                                    file_name=f"{base}_report.{report_ext}",
-                                    mime=report_mime,
-                                    use_container_width=True,
-                                    key=f"job_pdf_report_dl_{job['job_id']}",
-                                )
+    render_pdf_jobs_panel(current_user, api_key)
 
     batch_results = st.session_state.get("pdf_batch_results", [])
     if batch_results:
