@@ -17,6 +17,7 @@ import fitz
 import openpyxl
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
@@ -3259,6 +3260,14 @@ def get_translation_job(job_id: str, username: str) -> dict | None:
     return dict(row) if row else None
 
 
+def delete_translation_job(job_id: str, username: str) -> None:
+    with get_db_connection() as conn:
+        conn.execute(
+            "DELETE FROM translation_jobs WHERE job_id = ? AND username = ?",
+            (job_id, username),
+        )
+
+
 def _pdf_scope_report_rows(file_name: str, scope_cfg: dict, selected_pages, scope_detection, scope_mode: str) -> list[dict]:
     selected_page_nums = [
         pn + 1 for pn in (selected_pages or [])
@@ -4341,6 +4350,16 @@ with tab_pdf:
     if pdf_jobs:
         st.divider()
         st.subheader("PDF 后台任务")
+        auto_refresh_jobs = any(job["status"] in {"queued", "running"} for job in pdf_jobs)
+        if auto_refresh_jobs:
+            components.html(
+                """
+                <script>
+                setTimeout(() => window.parent.location.reload(), 3000);
+                </script>
+                """,
+                height=0,
+            )
         if st.button("刷新任务状态", use_container_width=True, key="refresh_pdf_jobs_btn"):
             st.rerun()
         for job in pdf_jobs:
@@ -4354,6 +4373,8 @@ with tab_pdf:
                 st.progress(float(job.get("progress") or 0), text=job.get("message") or label)
                 if job.get("error"):
                     st.error(job["error"])
+                if job["status"] == "failed":
+                    delete_translation_job(job["job_id"], current_user["username"])
                 if job["status"] == "running":
                     st.caption("如果进度长时间不动，可以重新启动这个后台任务。")
                     if st.button(
