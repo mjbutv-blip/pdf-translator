@@ -2818,7 +2818,13 @@ _WORKMANSHIP_KEYWORDS = {
 
 _NON_WORKMANSHIP_KEYWORDS = {
     "labels": 6,
+    "label": 5,
     "labeling manual": 7,
+    "care label": 8,
+    "care labels": 8,
+    "carelabel": 8,
+    "carelabels": 8,
+    "printing description": 8,
     "packaging": 6,
     "packing": 5,
     "plastic bag": 7,
@@ -2836,6 +2842,12 @@ _NON_WORKMANSHIP_KEYWORDS = {
     "saco de plástico": 7,
     "saco de plastico": 7,
     "barcode": 6,
+    "ean": 6,
+    "eans": 6,
+    "washing instructions": 8,
+    "wash instructions": 8,
+    "wash": 3,
+    "washing": 4,
     "sticker": 5,
     "hangtag": 5,
     "manual": 5,
@@ -2867,6 +2879,39 @@ def _short_label_score(lines: list[str]) -> int:
     return 0
 
 
+def _is_label_or_packaging_page(text: str, lines: list[str], image_count: int) -> tuple[bool, str]:
+    lowered = " ".join(lines).lower()
+    forced_terms = [
+        "care label",
+        "care labels",
+        "carelabel",
+        "carelabels",
+        "printing description",
+        "washing instructions",
+        "wash instructions",
+        "laundry bag",
+        "eans",
+        "barcode",
+        "etikett",
+        "label 1",
+        "label 2",
+    ]
+    for term in forced_terms:
+        if term in lowered:
+            return True, term
+
+    if ("front" in lowered and "back" in lowered) or ("vorderseite" in lowered and "rückseite" in lowered):
+        return True, "front/back layout"
+
+    if image_count >= 2 and len(lines) <= 25:
+        return True, "多图少正文"
+
+    if _short_label_score(lines) >= 2:
+        return True, "短标注过多"
+
+    return False, ""
+
+
 def detect_workmanship_pages(pdf_bytes: bytes) -> list[dict]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     rows: list[dict] = []
@@ -2875,6 +2920,7 @@ def detect_workmanship_pages(pdf_bytes: bytes) -> list[dict]:
             text = page.get_text("text") or ""
             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
             title_text = "\n".join(lines[:6])
+            image_count = sum(1 for b in page.get_text("dict")["blocks"] if b["type"] == 1)
             pos_score, pos_hits = _keyword_hits(text, _WORKMANSHIP_KEYWORDS)
             neg_score, neg_hits = _keyword_hits(text, _NON_WORKMANSHIP_KEYWORDS)
             title_bonus, title_hits = _keyword_hits(title_text, {
@@ -2885,9 +2931,13 @@ def detect_workmanship_pages(pdf_bytes: bytes) -> list[dict]:
                 "sketch": 5,
             })
             label_score = _short_label_score(lines)
-            image_bonus = 2 if sum(1 for b in page.get_text("dict")["blocks"] if b["type"] == 1) >= 1 else 0
+            forced_non_workmanship, forced_reason = _is_label_or_packaging_page(text, lines, image_count)
+            image_bonus = 2 if image_count >= 1 and (pos_score + title_bonus) > 0 else 0
             score = pos_score + title_bonus + label_score + image_bonus - neg_score
-            is_workmanship = score >= 3 and not (neg_score >= 7 and pos_score + title_bonus < 6)
+            if forced_non_workmanship:
+                is_workmanship = False
+            else:
+                is_workmanship = score >= 3 and not (neg_score >= 7 and pos_score + title_bonus < 6)
             reason_bits = []
             if title_hits:
                 reason_bits.append("标题命中：" + "、".join(title_hits))
@@ -2899,6 +2949,8 @@ def detect_workmanship_pages(pdf_bytes: bytes) -> list[dict]:
                 reason_bits.append("含图片/图稿")
             if neg_hits:
                 reason_bits.append("排除词：" + "、".join(neg_hits[:8]))
+            if forced_non_workmanship:
+                reason_bits.append(f"版式排除：{forced_reason}")
             rows.append({
                 "page_index": idx,
                 "page_number": idx + 1,
