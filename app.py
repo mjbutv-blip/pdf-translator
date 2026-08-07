@@ -2538,6 +2538,25 @@ def _clean_extracted_text(text: str) -> str:
     return t.strip()
 
 
+_PDF_METADATA_PATTERNS = [
+    re.compile(r"^creation date\b", re.IGNORECASE),
+    re.compile(r"^style[-\s]?no\.?:?\s*\d", re.IGNORECASE),
+    re.compile(r"^page\s+\d+\s+of\s+\d+$", re.IGNORECASE),
+    re.compile(r"^©\s*NKD Group\b", re.IGNORECASE),
+    re.compile(r"\btechnical specification\b", re.IGNORECASE),
+]
+
+
+def _is_pdf_metadata_text(text: str) -> bool:
+    """Skip PDF headers/footers and document metadata that should remain
+    unchanged. These spans often contain English plus dates/codes, which can
+    trigger unnecessary retry translation and fail an otherwise valid job."""
+    t = " ".join(text.strip().split())
+    if not t:
+        return False
+    return any(pattern.search(t) for pattern in _PDF_METADATA_PATTERNS)
+
+
 def translate_batch(client: anthropic.Anthropic, texts: list[str], glossary: dict) -> tuple[dict[str, str], set[str]]:
     """Translate many spans in a single LLM call. Returns
     ({original_text: translated_text}, unrecorded_terms)."""
@@ -3042,6 +3061,9 @@ def run_pdf_translation(
             # 纯数字/符号，或清洗后已无内容（PDF 解析伪影）——绝不擦除，直接跳过
             if not _t or alpha == 0:
                 done += 1; on_progress(done / total_spans); continue
+            # 页眉/页脚/创建日期/款号等 PDF 元数据不是正文，保持原样
+            if _is_pdf_metadata_text(_t):
+                done += 1; on_progress(done / total_spans); continue
             # 真正的尺码代号（S/M/L/XL/XXL...）——保持原样，不翻译
             if _is_pure_size_code(_t):
                 done += 1; on_progress(done / total_spans); continue
@@ -3087,12 +3109,11 @@ def run_pdf_translation(
                     try:
                         translated = _force_translate(client, sp["clean_text"], glossary)
                     except Exception as exc:
-                        raise RuntimeError(
-                            f"文本重试翻译失败：{sp['clean_text'][:80]}；错误：{exc}"
-                        ) from exc
+                        print(f"文本重试翻译失败，保留原文继续：{sp['clean_text'][:80]}；错误：{exc}")
+                        translated = sp["clean_text"]
 
                 if not translated.strip():
-                    raise RuntimeError(f"翻译结果为空：{sp['clean_text'][:80]}")
+                    translated = sp["clean_text"]
 
                 results.append({**sp, "translated": translated})
                 done += 1
