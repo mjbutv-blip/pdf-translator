@@ -6,6 +6,7 @@ import re
 import sqlite3
 import threading
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime
@@ -3276,6 +3277,7 @@ def _run_pdf_translation_job(job_id: str, api_key: str) -> None:
         job = dict(row)
         config = json.loads(job.get("config") or "{}")
         update_translation_job(job_id, status="running", progress=0.01, message="正在准备翻译")
+        last_progress_write = {"ts": 0.0, "value": 0.0}
 
         font_bytes = job.get("aux_bytes")
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3301,7 +3303,16 @@ def _run_pdf_translation_job(job_id: str, api_key: str) -> None:
                 update_translation_job(job_id, message=str(preview)[:180])
 
             def on_progress(frac):
-                update_translation_job(job_id, progress=max(0.0, min(float(frac), 1.0)))
+                progress = max(0.0, min(float(frac), 1.0))
+                now = time.monotonic()
+                if (
+                    progress >= 1.0
+                    or progress - last_progress_write["value"] >= 0.01
+                    or now - last_progress_write["ts"] >= 1.5
+                ):
+                    last_progress_write["ts"] = now
+                    last_progress_write["value"] = progress
+                    update_translation_job(job_id, progress=progress)
 
             selected_pages = config.get("selected_pages")
             scope_detection = config.get("scope_detection") or []
