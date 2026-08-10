@@ -6,5 +6,6 @@ openpyxl
 Pillow
 gspread
 google-auth
+openai
 psycopg[binary]
 xlrd

@@ -17,13 +17,14 @@ import fitz
 import openpyxl
 import pandas as pd
 import streamlit as st
+from openai import OpenAI
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 DEFAULT_FONT     = Path(__file__).parent / "font.ttf"
 DEFAULT_GLOSSARY = Path(__file__).parent / "glossary.xlsx"
 DB_PATH          = Path(__file__).parent / "pdf_project.db"
-ANTHROPIC_MODEL  = "claude-sonnet-4-20250514"
+OPENAI_MODEL     = "gpt-5.6-terra"
 
 
 # ── Local user/customer/glossary access control ────────────────────────────────
@@ -49,38 +50,131 @@ def _database_url() -> str:
     return _secret_or_env("DATABASE_URL", "").strip()
 
 
-ANTHROPIC_MODEL = _secret_or_env("ANTHROPIC_MODEL", ANTHROPIC_MODEL)
-ANTHROPIC_TIMEOUT_SECONDS = max(20, _int_secret_or_env("ANTHROPIC_TIMEOUT_SECONDS", 45))
-ANTHROPIC_FALLBACK_MODELS = [
+OPENAI_API_KEY = _secret_or_env("OPENAI_API_KEY", "") or _secret_or_env("ANTHROPIC_API_KEY", "")
+OPENAI_MODEL = _secret_or_env("OPENAI_MODEL", OPENAI_MODEL)
+OPENAI_TIMEOUT_SECONDS = max(20, _int_secret_or_env("OPENAI_TIMEOUT_SECONDS", 45))
+OPENAI_REASONING_EFFORT = _secret_or_env("OPENAI_REASONING_EFFORT", "low")
+OPENAI_FALLBACK_MODELS = [
     model.strip()
     for model in _secret_or_env(
-        "ANTHROPIC_FALLBACK_MODELS",
-        "claude-3-5-sonnet-20241022,claude-3-5-haiku-20241022,claude-3-haiku-20240307",
+        "OPENAI_FALLBACK_MODELS",
+        "gpt-5.6-luna,gpt-5.4-mini",
     ).split(",")
     if model.strip()
 ]
+
+# Backward-compatible aliases so the rest of the file can be migrated gradually.
+ANTHROPIC_MODEL = OPENAI_MODEL
+ANTHROPIC_TIMEOUT_SECONDS = OPENAI_TIMEOUT_SECONDS
+ANTHROPIC_FALLBACK_MODELS = OPENAI_FALLBACK_MODELS
 
 
 def _model_not_found_error(exc: Exception) -> bool:
     status_code = getattr(exc, "status_code", None)
     text = str(exc).lower()
-    return status_code == 404 and "model:" in text and "not_found" in text
+    return status_code == 404 and ("model" in text or "not_found" in text)
 
 
-def _create_anthropic_message(client: anthropic.Anthropic, **kwargs):
-    requested_model = kwargs.pop("model", ANTHROPIC_MODEL)
-    kwargs.setdefault("timeout", ANTHROPIC_TIMEOUT_SECONDS)
-    models_to_try = list(dict.fromkeys([requested_model, *ANTHROPIC_FALLBACK_MODELS]))
+def _response_output_text(response) -> str:
+    text = getattr(response, "output_text", "") or ""
+    if text:
+        return str(text).strip()
+    chunks: list[str] = []
+    for item in getattr(response, "output", []) or []:
+        for content in getattr(item, "content", []) or []:
+            if getattr(content, "type", "") == "output_text":
+                chunks.append(str(getattr(content, "text", "")))
+    return "".join(chunks).strip()
+
+
+def _openai_image_content(image_data: dict) -> dict:
+    source = image_data.get("source") or {}
+    if source.get("type") == "base64":
+        media_type = source.get("media_type") or "image/png"
+        data = source.get("data") or ""
+        return {
+            "type": "input_image",
+            "image_url": f"data:{media_type};base64,{data}",
+            "detail": "high",
+        }
+    return {
+        "type": "input_image",
+        "image_url": image_data.get("image_url") or "",
+        "detail": image_data.get("detail") or "high",
+    }
+
+
+def _build_openai_input_messages(system: str, messages: list[dict] | None) -> list[dict]:
+    input_messages: list[dict] = []
+    if system:
+        input_messages.append({
+            "type": "message",
+            "role": "system",
+            "content": system,
+        })
+    for msg in messages or []:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            input_messages.append({
+                "type": "message",
+                "role": role,
+                "content": content,
+            })
+            continue
+        mapped_content = []
+        for part in content:
+            part_type = part.get("type")
+            if part_type in {"text", "input_text"}:
+                mapped_content.append({
+                    "type": "input_text",
+                    "text": str(part.get("text", "")),
+                })
+            elif part_type in {"image", "input_image"}:
+                mapped_content.append(_openai_image_content(part))
+        input_messages.append({
+            "type": "message",
+            "role": role,
+            "content": mapped_content,
+        })
+    return input_messages
+
+
+def _create_anthropic_message(client: OpenAI, **kwargs):
+    requested_model = kwargs.pop("model", OPENAI_MODEL)
+    timeout = kwargs.pop("timeout", OPENAI_TIMEOUT_SECONDS)
+    max_output_tokens = kwargs.pop("max_tokens", kwargs.pop("max_output_tokens", None))
+    temperature = kwargs.pop("temperature", None)
+    system = kwargs.pop("system", "")
+    messages = kwargs.pop("messages", None)
+    text_config = kwargs.pop("text", None)
+    reasoning = kwargs.pop("reasoning", None)
+    models_to_try = list(dict.fromkeys([requested_model, *OPENAI_FALLBACK_MODELS]))
+    input_messages = _build_openai_input_messages(system, messages)
+    create_kwargs = {
+        "input": input_messages,
+        "timeout": timeout,
+    }
+    if max_output_tokens is not None:
+        create_kwargs["max_output_tokens"] = max_output_tokens
+    if temperature is not None:
+        create_kwargs["temperature"] = temperature
+    if text_config is not None:
+        create_kwargs["text"] = text_config
+    if reasoning is not None:
+        create_kwargs["reasoning"] = reasoning
+    else:
+        create_kwargs["reasoning"] = {"effort": OPENAI_REASONING_EFFORT}
     for model in models_to_try:
         try:
-            return client.messages.create(model=model, **kwargs)
+            return client.responses.create(model=model, **create_kwargs)
         except Exception as exc:
             if _model_not_found_error(exc):
                 continue
             raise
     raise RuntimeError(
-        "所有配置的 Anthropic 模型都不可用。请检查 API key 所属账号可用模型，"
-        "或在 Streamlit Secrets 里设置 ANTHROPIC_MODEL。已尝试："
+        "所有配置的 OpenAI 模型都不可用。请检查 API key 所属账号可用模型，"
+        "或在 Streamlit Secrets 里设置 OPENAI_MODEL。已尝试："
         + "；".join(models_to_try)
     )
 
@@ -1162,7 +1256,7 @@ def suggest_term_candidate_translations(
         system=_GARMENT_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
     )
-    raw = msg.content[0].text.strip()
+    raw = _response_output_text(msg)
     raw = re.sub(r"^```[a-z]*\n?", "", raw)
     raw = re.sub(r"\n?```$", "", raw)
     m = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -2630,7 +2724,7 @@ def translate_batch(client: anthropic.Anthropic, texts: list[str], glossary: dic
         system=_GARMENT_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
     )
-    raw = msg.content[0].text.strip()
+    raw = _response_output_text(msg)
     raw = re.sub(r"^```[a-z]*\n?", "", raw)
     raw = re.sub(r"\n?```$", "", raw)
     m = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -2769,7 +2863,7 @@ def _force_translate(client: anthropic.Anthropic, text: str, glossary: dict) -> 
         system=_GARMENT_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
     )
-    return msg.content[0].text.strip()
+    return _response_output_text(msg)
 
 
 def _insert_text(page, bbox, text: str, size: float, font_path: str):
@@ -3087,7 +3181,7 @@ def run_pdf_translation(
 ) -> tuple[bytes, bytes, int]:
     """Returns (pdf_out, xlsx_out, n_unrecorded_terms)."""
     glossary = load_glossary(glossary_bytes)
-    client = anthropic.Anthropic(api_key=api_key)
+    client = OpenAI(api_key=api_key)
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     total_pages = len(doc)
     selected_page_set = None if selected_pages is None else {
@@ -3630,7 +3724,7 @@ def translate_cell_text(client: anthropic.Anthropic, text: str, glossary: dict) 
         system=_GARMENT_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
     )
-    return msg.content[0].text.strip()
+    return _response_output_text(msg)
 
 
 def _cell_merge_anchor(ws, cell) -> tuple[bool, bool]:
@@ -3677,7 +3771,7 @@ def run_excel_translation(
     Returns (xlsx_out, n_cells_translated, n_images_translated, report_rows).
     """
     glossary = load_glossary(glossary_bytes)
-    client = anthropic.Anthropic(api_key=api_key)
+    client = OpenAI(api_key=api_key)
 
     # ── 阶段 1：翻译文字单元格 ──────────────────────────────────────────────────
     # 不用 data_only=True：公式必须保留原样（"="开头的字符串），否则保存时
@@ -3839,7 +3933,7 @@ def _vision_extract_items(
     ext: str,
     glossary: dict,
 ) -> list[dict]:
-    """让 Claude Vision 识别图片里的英文标注，返回
+    """让 OpenAI Vision 识别图片里的英文标注，返回
     [{"en":..., "zh":..., "x":0~1, "y":0~1, "size":int}, ...]（大致坐标，非精确测量）。
     失败或无文字时返回 []。"""
     media_type = _MIME.get(ext)
@@ -3875,7 +3969,7 @@ def _vision_extract_items(
                 ],
             }],
         )
-        raw = resp.content[0].text.strip()
+        raw = _response_output_text(resp)
         raw = re.sub(r"^```[a-z]*\n?", "", raw)
         raw = re.sub(r"\n?```$", "", raw)
         m = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -3892,7 +3986,7 @@ def _translate_image_bytes(
     ext: str,
     glossary: dict,
 ) -> bytes:
-    """Send one image to Claude Vision, overlay Chinese translations, return new bytes."""
+    """Send one image to OpenAI Vision, overlay Chinese translations, return new bytes."""
     items = _vision_extract_items(client, img_bytes, ext, glossary)
     if not items:
         return img_bytes
@@ -4329,7 +4423,7 @@ st.set_page_config(
 )
 
 st.title("🧵 服装行业翻译引擎")
-st.caption("支持 PDF 与 Excel (.xlsx) 双格式 · 上传文件 + 术语库 · 调用 Claude 自动翻译为中文")
+st.caption("支持 PDF 与 Excel (.xlsx) 双格式 · 上传文件 + 术语库 · 调用 OpenAI 自动翻译为中文")
 st.divider()
 
 run_startup_tasks_once(_use_postgres(), 1)
@@ -4355,10 +4449,10 @@ if "glossary_df" not in st.session_state:
 
 # ── API Key（全局共用）───────────────────────────────────────────────────────
 api_key = st.text_input(
-    "🔑 Anthropic API Key",
+    "🔑 OpenAI API Key",
     type="password",
-    value=os.environ.get("ANTHROPIC_API_KEY", ""),
-    placeholder="sk-ant-api03-...",
+    value=os.environ.get("OPENAI_API_KEY", "") or os.environ.get("ANTHROPIC_API_KEY", ""),
+    placeholder="sk-...",
 )
 st.divider()
 
@@ -4462,7 +4556,7 @@ with tab_pdf:
         if not pdf_files:
             missing.append("PDF 文件")
         if not api_key:
-            missing.append("Anthropic API Key")
+            missing.append("OpenAI API Key")
         if not font_ready:
             missing.append("中文字体 TTF")
         if not customer_ready:
@@ -4805,7 +4899,7 @@ with tab_excel:
         if not excel_files:
             missing.append("Excel 文件")
         if not api_key:
-            missing.append("Anthropic API Key")
+            missing.append("OpenAI API Key")
         if not customer_ready:
             missing.append("有权限的客户")
         st.info(f"请先提供：{'、'.join(missing)}")
@@ -4874,7 +4968,7 @@ with tab_excel:
                         def on_image(i, total, fname):
                             img_ph.caption(f"🖼️ 图片译文 {i}/{total}：{fname}")
 
-                        client = anthropic.Anthropic(api_key=api_key)
+                        client = OpenAI(api_key=api_key)
                         excel_out, img_report_rows = add_translated_textboxes_to_excel(
                             excel_out, client, glossary_dict, on_image,
                             selected_sheets=selected_sheets,
