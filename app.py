@@ -1078,6 +1078,15 @@ _RE_STYLE_LIKE = re.compile(r"^[A-Z]{1,4}\d{3,}[A-Z0-9\-/ ]*$")
 _RE_PANTONE_LIKE = re.compile(r"^(?:pantone\s*)?\d{2,4}\s*[A-Z]?$", re.IGNORECASE)
 _RE_FILE_PATH_LIKE = re.compile(r"(^/|[A-Za-z]:\\|[/\\][^/\\]+\.(?:pdf|xlsx?)$|\.(?:pdf|xlsx?)$)", re.IGNORECASE)
 _RE_TERM_TOKEN = re.compile(r"[A-Za-z][A-Za-z&'’.\-]*")
+_RE_COLOR_CODE_NAME = re.compile(
+    r"^(?:pantone\s*)?(?:\d{1,2}\s+\d{3,4}|\d{4,6})(?:\s+[A-Za-z][A-Za-z&'’.\-]*){1,4}$",
+    re.IGNORECASE,
+)
+_COLOR_HINT_WORDS = {
+    "color", "colour", "pantone", "swatch", "shade", "colourway", "colour way",
+    "colour ways", "colourways", "pms", "colorway", "colorways", "palette",
+    "色号", "色卡", "色样", "颜色", "色板",
+}
 
 
 def normalize_term(term: str) -> str:
@@ -1099,6 +1108,20 @@ def normalize_term_key(text: str) -> str:
 def normalized_key_low_confidence(text: str) -> bool:
     words = set(re.findall(r"[a-z]+", str(text or "").lower()))
     return bool(words & _AMBIGUOUS_DIRECTION_WORDS)
+
+
+def _is_color_item(text: str) -> bool:
+    t = re.sub(r"\s+", " ", str(text or "").strip())
+    if not t:
+        return False
+    tl = t.lower()
+    if any(hint in tl for hint in _COLOR_HINT_WORDS):
+        return True
+    if _RE_COLOR_CODE_NAME.match(t):
+        return True
+    if re.search(r"\bpantone\b", tl) and re.search(r"[A-Za-z]", t):
+        return True
+    return False
 
 
 def glossary_conflicts_by_key(customer_id: str, normalized_key: str) -> list[dict]:
@@ -1146,6 +1169,8 @@ def is_noise_term(term: str) -> bool:
     if not alpha:
         return True
     if nl in _TERM_STOPWORDS or nl in _BRAND_LIKE_TERMS:
+        return True
+    if _is_color_item(t):
         return True
     if len(t) <= 1:
         return True
@@ -3368,6 +3393,8 @@ def run_pdf_translation(
             # 纯数字/符号，或清洗后已无内容（PDF 解析伪影）——绝不擦除，直接跳过
             if not _t or alpha == 0:
                 done += 1; on_progress(done / total_spans); continue
+            if _is_color_item(_t):
+                done += 1; on_progress(done / total_spans); continue
             # 页眉/页脚/创建日期/款号等 PDF 元数据不是正文，保持原样
             if _is_pdf_metadata_text(_t):
                 done += 1; on_progress(done / total_spans); continue
@@ -3943,7 +3970,7 @@ def run_excel_translation(
         if selected_sheet_set is None or ws.title in selected_sheet_set
         for row in ws.iter_rows()
         for cell in row
-        if _is_translatable(cell.value)
+        if _is_translatable(cell.value) and not _is_color_item(str(cell.value))
     ]
     n_cells = len(to_translate)
     total_steps = max(n_cells, 1)
@@ -4182,7 +4209,8 @@ def _translate_image_bytes(
 
     for item in items:
         zh = str(item.get("zh", "")).strip()
-        if not zh:
+        en = str(item.get("en", "")).strip()
+        if not zh or _is_color_item(en):
             continue
         x = int(float(item.get("x", 0.5)) * iw)
         y = int(float(item.get("y", 0.5)) * ih)
@@ -4559,7 +4587,7 @@ def add_translated_textboxes_to_excel(
             for item in items:
                 zh = str(item.get("zh", "")).strip()
                 en = str(item.get("en", "")).strip()
-                if not zh:
+                if not zh or _is_color_item(en):
                     continue
                 x_norm = max(0.0, min(float(item.get("x", 0.5)), 0.95))
                 y_norm = max(0.0, min(float(item.get("y", 0.5)), 0.95))
