@@ -1066,6 +1066,9 @@ _TERM_STOPWORDS = {
     "it", "of", "on", "or", "the", "to", "with", "without", "this", "that",
     "option", "season", "style", "supplier", "owner", "collection", "division",
     "description", "comments", "instructions", "page", "date", "plan", "type",
+    "designer", "design", "designed", "designs", "fashion", "trend", "trends",
+    "sample", "samples", "layout", "artwork", "diagram", "drawing", "view",
+    "product", "products", "item", "items", "look", "looks", "brand",
 }
 _KEY_STOPWORDS = {"of", "the", "a", "an", "for", "to"}
 _AMBIGUOUS_DIRECTION_WORDS = {
@@ -1086,6 +1089,26 @@ _COLOR_HINT_WORDS = {
     "color", "colour", "pantone", "swatch", "shade", "colourway", "colour way",
     "colour ways", "colourways", "pms", "colorway", "colorways", "palette",
     "色号", "色卡", "色样", "颜色", "色板",
+}
+_NON_WORKMANSHIP_TERM_WORDS = {
+    "designer", "design", "designed", "designs", "fashion", "trend", "trends",
+    "sample", "samples", "layout", "artwork", "diagram", "drawing", "view",
+    "product", "products", "item", "items", "look", "looks", "brand", "season",
+    "collection", "collections", "supplier", "owner", "comments", "instructions",
+    "description", "page", "date", "type", "plan",
+}
+_WORKMANSHIP_SIGNAL_WORDS = {
+    "seam", "seams", "sewing", "stitch", "stitching", "stitches", "binding",
+    "hem", "hems", "cuff", "cuffs", "collar", "collars", "sleeve", "sleeves",
+    "neckline", "armhole", "waist", "waistband", "gusset", "panel", "panels",
+    "placket", "yoke", "lining", "interlining", "padding", "pad", "elastic",
+    "elasticated", "strap", "straps", "bra", "cup", "cups", "hook", "eye",
+    "zipper", "zip", "snap", "snaps", "closure", "fabric", "shell", "thread",
+    "woven", "knit", "knitted", "knitting", "print", "printing", "printed",
+    "embroider", "embroidered", "embroidery", "lace", "mesh", "foam", "bonded",
+    "fusing", "fused", "overlock", "interlock", "underband", "support", "elasticity",
+    "polyamide", "polyester", "nylon", "elastane", "spandex", "cotton", "modal",
+    "viscose", "rayon", "lyocell", "acrylic", "wool", "silk", "bamboo",
 }
 
 
@@ -1122,6 +1145,30 @@ def _is_color_item(text: str) -> bool:
     if re.search(r"\bpantone\b", tl) and re.search(r"[A-Za-z]", t):
         return True
     return False
+
+
+def _is_workmanship_candidate_term(term: str, context: str = "") -> bool:
+    t = re.sub(r"\s+", " ", str(term or "").strip())
+    if not t or is_noise_term(t) or _is_color_item(t):
+        return False
+    tokens = [tok.lower() for tok in re.findall(r"[A-Za-z]+", t)]
+    if not tokens:
+        return False
+    if any(tok in _NON_WORKMANSHIP_TERM_WORDS for tok in tokens):
+        return False
+    if context:
+        ctx_tokens = {tok.lower() for tok in re.findall(r"[A-Za-z]+", str(context))}
+        if ctx_tokens & _NON_WORKMANSHIP_TERM_WORDS and not (ctx_tokens & _WORKMANSHIP_SIGNAL_WORDS):
+            return False
+    if len(tokens) == 1:
+        return tokens[0] in _WORKMANSHIP_SIGNAL_WORDS
+    if any(tok in _WORKMANSHIP_SIGNAL_WORDS for tok in tokens):
+        return True
+    lowered = t.lower()
+    return bool(re.search(
+        r"(seam|stitch|bind|hem|cuff|collar|sleeve|neckline|armhole|waist|gusset|placket|yoke|lining|elastic|strap|zip|snap|hook|eye|fabric|thread|print|embroider|lace|mesh|foam|poly|cotton|nylon|modal|viscose|rayon|lyocell|spandex|elastane)",
+        lowered,
+    ))
 
 
 def glossary_conflicts_by_key(customer_id: str, normalized_key: str) -> list[dict]:
@@ -1215,7 +1262,7 @@ def extract_candidate_terms_from_text(text: str, glossary: dict) -> list[str]:
     parts = re.split(r"[\n\r;,，。:：|()（）\[\]{}]+", cleaned)
     for part in parts:
         phrase = re.sub(r"\s+", " ", part).strip(" -_./")
-        if not phrase or is_noise_term(phrase):
+        if not phrase or not _is_workmanship_candidate_term(phrase, cleaned):
             continue
         words = _RE_TERM_TOKEN.findall(phrase)
         if not words:
@@ -1224,7 +1271,7 @@ def extract_candidate_terms_from_text(text: str, glossary: dict) -> list[str]:
             for i in range(0, len(words) - n + 1):
                 cand = " ".join(words[i:i + n]).strip()
                 key = normalize_term_key(cand) or normalize_term(cand)
-                if key in active_keys or is_noise_term(cand):
+                if key in active_keys or not _is_workmanship_candidate_term(cand, phrase):
                     continue
                 if n == 1 and len(cand) < 4:
                     continue
@@ -3423,8 +3470,10 @@ def run_pdf_translation(
             on_block(f"批量翻译 {len(texts)} 项…")
             try:
                 mapping, unrecorded_batch = translate_batch_resilient(client, texts, glossary)
-                all_unrecorded |= unrecorded_batch
                 for term in unrecorded_batch:
+                    if not _is_workmanship_candidate_term(term, sp["clean_text"]):
+                        continue
+                    all_unrecorded.add(term)
                     context = next(
                         (t for t in texts if normalize_term(term) in normalize_term(t)),
                         texts[0] if texts else "",
