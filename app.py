@@ -1464,6 +1464,16 @@ def _persist_term_candidates(
     if not merged_candidates:
         return 0
 
+    conflict_keys = glossary_conflict_keys_from_dict(glossary)
+    conflict_terms_by_key: dict[str, str] = {}
+    for en in glossary:
+        k = normalize_term_key(en)
+        if k in conflict_keys:
+            conflict_terms_by_key.setdefault(k, "")
+            conflict_terms_by_key[k] = (
+                f"{conflict_terms_by_key[k]}; {en}" if conflict_terms_by_key[k] else en
+            )
+
     suggestions: dict[str, dict] = {}
     if client is not None:
         for batch in _chunk(list(merged_candidates.values()), 40):
