@@ -1318,11 +1318,14 @@ def save_term_candidates(
         if (normalize_term_key(k) or normalize_term(k)) not in conflict_keys
     }
     pending_keys = _pending_term_keys(customer_id)
+    workmanship_only = any("is_workmanship_source" in item for item in candidate_contexts)
     merged: dict[str, dict] = {}
     for item in candidate_contexts:
         term = str(item.get("term", "")).strip()
         key = normalize_term_key(term) or normalize_term(term)
         if not key or key in active_keys or key in pending_keys or is_noise_term(term):
+            continue
+        if workmanship_only and not bool(item.get("is_workmanship_source")):
             continue
         if key not in merged:
             merged[key] = {
@@ -3214,6 +3217,11 @@ def run_pdf_translation(
 
     total_spans = max(sum(len(s) for s in page_spans), 1)
     done = 0
+    workmanship_by_page = {
+        row["page_number"]: bool(row.get("is_workmanship"))
+        for row in (scope_detection or detect_workmanship_pages(pdf_bytes))
+        if row.get("page_number")
+    }
 
     for pn, spans in enumerate(page_spans):
         if selected_page_set is not None and pn not in selected_page_set:
@@ -3260,6 +3268,7 @@ def run_pdf_translation(
                         "page_or_sheet": f"第 {pn + 1} 页",
                         "cell_coordinate": "",
                         "source_type": "PDF",
+                        "is_workmanship_source": workmanship_by_page.get(pn + 1, False),
                     })
             except Exception as exc:
                 raise RuntimeError(f"批量翻译 API 调用失败：{exc}") from exc
@@ -3272,6 +3281,7 @@ def run_pdf_translation(
                         "page_or_sheet": f"第 {pn + 1} 页",
                         "cell_coordinate": "",
                         "source_type": "PDF",
+                        "is_workmanship_source": workmanship_by_page.get(pn + 1, False),
                     })
                 translated = mapping.get(sp["clean_text"], "")
                 if _needs_retranslation(sp["clean_text"], translated):
@@ -3800,6 +3810,12 @@ def run_excel_translation(
         for row in (scope_detection or [])
         if row.get("sheet_name")
     }
+    if not detection_by_sheet:
+        detection_by_sheet = {
+            row.get("sheet_name"): row
+            for row in detect_workmanship_sheets(xlsx_bytes)
+            if row.get("sheet_name")
+        }
 
     for sheet_name in skipped_sheets:
         det = detection_by_sheet.get(sheet_name, {})
@@ -3863,6 +3879,7 @@ def run_excel_translation(
                     "page_or_sheet": sheet_name,
                     "cell_coordinate": cell.coordinate,
                     "source_type": "Excel",
+                    "is_workmanship_source": bool(detection_by_sheet.get(sheet_name, {}).get("is_workmanship")),
                 })
         except Exception as e:
             row_report["status"] = "error"
