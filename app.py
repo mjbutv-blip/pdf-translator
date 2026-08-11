@@ -1303,6 +1303,44 @@ def save_term_candidates(
 ) -> int:
     if not customer_id or not candidate_contexts:
         return 0
+    merged, _summary = _merge_term_candidate_contexts(
+        customer_id,
+        candidate_contexts,
+        glossary,
+        source_type=source_type,
+    )
+    if not merged:
+        return 0
+    _persist_term_candidates(
+        customer_id=customer_id,
+        source_file_name=source_file_name,
+        source_type=source_type,
+        created_by=created_by,
+        merged_candidates=merged,
+        glossary=glossary,
+        client=client,
+    )
+    return len(merged)
+
+
+def _merge_term_candidate_contexts(
+    customer_id: str,
+    candidate_contexts: list[dict],
+    glossary: dict,
+    source_type: str = "",
+) -> tuple[dict[str, dict], dict]:
+    if not customer_id or not candidate_contexts:
+        return {}, {
+            "total_contexts": 0,
+            "filtered_active": 0,
+            "filtered_pending": 0,
+            "filtered_noise": 0,
+            "filtered_scope": 0,
+            "workmanship_only": False,
+            "candidate_count": 0,
+            "review_terms": [],
+            "review_locations": [],
+        }
     conflict_keys = glossary_conflict_keys_from_dict(glossary)
     conflict_terms_by_key: dict[str, str] = {}
     for en in glossary:
@@ -1320,12 +1358,31 @@ def save_term_candidates(
     pending_keys = _pending_term_keys(customer_id)
     workmanship_only = any("is_workmanship_source" in item for item in candidate_contexts)
     merged: dict[str, dict] = {}
+    stats = {
+        "total_contexts": len(candidate_contexts),
+        "filtered_active": 0,
+        "filtered_pending": 0,
+        "filtered_noise": 0,
+        "filtered_scope": 0,
+        "workmanship_only": workmanship_only,
+    }
     for item in candidate_contexts:
         term = str(item.get("term", "")).strip()
         key = normalize_term_key(term) or normalize_term(term)
-        if not key or key in active_keys or key in pending_keys or is_noise_term(term):
+        if not key:
+            stats["filtered_noise"] += 1
+            continue
+        if key in active_keys:
+            stats["filtered_active"] += 1
+            continue
+        if key in pending_keys:
+            stats["filtered_pending"] += 1
+            continue
+        if is_noise_term(term):
+            stats["filtered_noise"] += 1
             continue
         if workmanship_only and not bool(item.get("is_workmanship_source")):
+            stats["filtered_scope"] += 1
             continue
         if key not in merged:
             merged[key] = {
@@ -1335,7 +1392,7 @@ def save_term_candidates(
                 "page_or_sheet": str(item.get("page_or_sheet", "")).strip(),
                 "cell_coordinate": str(item.get("cell_coordinate", "")).strip(),
                 "frequency": 0,
-                "source_type": source_type,
+                "source_type": source_type or str(item.get("source_type", "")).strip(),
             }
         if term not in merged[key]["variants"]:
             merged[key]["variants"].append(term)
@@ -1343,12 +1400,50 @@ def save_term_candidates(
         if item.get("context") and len(str(item["context"])) > len(merged[key]["context"]):
             merged[key]["context"] = str(item["context"]).strip()
 
-    if not merged:
+    merged_items = sorted(
+        merged.values(),
+        key=lambda x: (-int(x.get("frequency", 0) or 0), str(x.get("term", "")).lower()),
+    )
+    review_terms: list[str] = []
+    review_locations: list[str] = []
+    for item in merged_items:
+        if item.get("term") and item["term"] not in review_terms:
+            review_terms.append(item["term"])
+        loc = " ".join(
+            part for part in [
+                str(item.get("source_type", "")).strip(),
+                str(item.get("page_or_sheet", "")).strip(),
+                str(item.get("cell_coordinate", "")).strip(),
+            ]
+            if part
+        ).strip()
+        if loc and loc not in review_locations:
+            review_locations.append(loc)
+        if len(review_terms) >= 5 and len(review_locations) >= 5:
+            break
+    stats.update({
+        "candidate_count": len(merged_items),
+        "review_terms": review_terms[:5],
+        "review_locations": review_locations[:5],
+    })
+    return merged, stats
+
+
+def _persist_term_candidates(
+    customer_id: str,
+    source_file_name: str,
+    source_type: str,
+    created_by: str,
+    merged_candidates: dict[str, dict],
+    glossary: dict,
+    client: anthropic.Anthropic | None = None,
+) -> int:
+    if not merged_candidates:
         return 0
 
     suggestions: dict[str, dict] = {}
     if client is not None:
-        for batch in _chunk(list(merged.values()), 40):
+        for batch in _chunk(list(merged_candidates.values()), 40):
             try:
                 suggestions.update(suggest_term_candidate_translations(client, batch, glossary))
             except Exception:
@@ -1357,7 +1452,7 @@ def save_term_candidates(
     now = _now_iso()
     saved = 0
     with get_db_connection() as conn:
-        for key, item in merged.items():
+        for key, item in merged_candidates.items():
             suggestion = suggestions.get(key, {})
             zh = suggestion.get("translation", "")
             confidence = suggestion.get("confidence", "medium")
@@ -1449,6 +1544,43 @@ def save_term_candidates(
                 )
             saved += 1
     return saved
+
+
+def _build_translation_review_summary(
+    n_unrecorded_terms: int,
+    candidate_stats: dict,
+) -> dict:
+    review_count = int(candidate_stats.get("candidate_count", 0) or 0)
+    review_terms = candidate_stats.get("review_terms") or []
+    review_locations = candidate_stats.get("review_locations") or []
+    workmanship_only = bool(candidate_stats.get("workmanship_only"))
+
+    if review_count == 0 and n_unrecorded_terms == 0:
+        summary_text = "本次翻译全部基于术语库完成，未发现需人工核查项。"
+    elif review_count == 0:
+        summary_text = f"本次翻译未发现需补充的做工术语，但仍有 {n_unrecorded_terms} 个未收录术语。"
+    elif n_unrecorded_terms == 0:
+        summary_text = f"本次翻译已基于术语库完成，另有 {review_count} 处做工相关待补充项，建议重点核查。"
+    else:
+        summary_text = (
+            f"本次翻译基于术语库完成，发现 {n_unrecorded_terms} 个未收录术语 "
+            f"和 {review_count} 处做工相关待补充项。"
+        )
+
+    if review_terms:
+        summary_text += f" 重点术语：{'、'.join(review_terms[:3])}。"
+    if review_locations:
+        summary_text += f" 重点位置：{'、'.join(review_locations[:3])}。"
+
+    return {
+        "summary_text": summary_text,
+        "n_unrecorded_terms": int(n_unrecorded_terms),
+        "n_review_items": review_count,
+        "review_terms": review_terms[:5],
+        "review_locations": review_locations[:5],
+        "workmanship_only": workmanship_only,
+        "needs_manual_review": bool(review_count or n_unrecorded_terms),
+    }
 
 
 def list_term_candidates(user: dict, customer_id: str | None = None, status: str | None = None) -> list[dict]:
@@ -3181,8 +3313,8 @@ def run_pdf_translation(
     selected_pages: list[int] | None = None,
     scope_mode: str = "all",
     scope_detection: list[dict] | None = None,
-) -> tuple[bytes, bytes, int]:
-    """Returns (pdf_out, xlsx_out, n_unrecorded_terms)."""
+) -> tuple[bytes, bytes, int, dict]:
+    """Returns (pdf_out, xlsx_out, n_unrecorded_terms, review_summary)."""
     glossary = load_glossary(glossary_bytes)
     client = OpenAI(api_key=api_key)
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -3336,7 +3468,14 @@ def run_pdf_translation(
             client=client,
         )
 
-    return pdf_buf.getvalue(), xlsx_buf.getvalue(), len(all_unrecorded)
+    _, candidate_stats = _merge_term_candidate_contexts(
+        customer_id or "",
+        candidate_contexts,
+        glossary,
+        source_type="PDF",
+    )
+    review_summary = _build_translation_review_summary(len(all_unrecorded), candidate_stats)
+    return pdf_buf.getvalue(), xlsx_buf.getvalue(), len(all_unrecorded), review_summary
 
 
 _RUNNING_JOB_THREADS: dict[str, threading.Thread] = {}
@@ -3522,7 +3661,7 @@ def _run_pdf_translation_job(job_id: str, api_key: str, start_next_on_finish: bo
             scope_detection = config.get("scope_detection") or []
             scope_cfg = config.get("scope_cfg") or {}
             scope_mode = config.get("scope_mode") or "all"
-            pdf_out, xlsx_out, n_terms = run_pdf_translation(
+            pdf_out, xlsx_out, n_terms, review_summary = run_pdf_translation(
                 pdf_bytes=job["input_bytes"],
                 glossary_bytes=glossary_bytes,
                 font_path=font_path,
@@ -3573,6 +3712,7 @@ def _run_pdf_translation_job(job_id: str, api_key: str, start_next_on_finish: bo
                         "has_scope_report": bool(scope_report),
                         "has_unrecorded_terms": bool(xlsx_out),
                         "report_kind": report_kind,
+                        "review_summary": review_summary,
                     },
                     ensure_ascii=False,
                 ),
@@ -3665,7 +3805,13 @@ def render_pdf_jobs_panel(current_user: dict, api_key: str) -> None:
                 if full_job:
                     meta = json.loads(full_job.get("result_meta") or "{}")
                     base = full_job["source_file_name"].rsplit(".", 1)[0]
-                    st.caption(f"未收录术语：{meta.get('n_terms', 0)} 条")
+                    review_summary = meta.get("review_summary") or {}
+                    if review_summary.get("summary_text"):
+                        st.info(review_summary["summary_text"])
+                    else:
+                        st.caption(f"未收录术语：{meta.get('n_terms', 0)} 条")
+                    if review_summary.get("needs_manual_review") and review_summary.get("review_locations"):
+                        st.caption(f"重点核查位置：{'、'.join(review_summary['review_locations'][:3])}")
                     dl_cols = st.columns(2)
                     with dl_cols[0]:
                         st.download_button(
@@ -3773,7 +3919,7 @@ def run_excel_translation(
     selected_sheets: list[str] | None = None,
     scope_mode: str = "all",
     scope_detection: list[dict] | None = None,
-) -> tuple[bytes, int, int, list[dict]]:
+) -> tuple[bytes, int, int, list[dict], dict]:
     """Translate text cells (in place, formulas untouched) across ALL sheets.
     Embedded-image text translation is OFF by default (translate_images=False) —
     it rasterizes Chinese into image pixels, which is not editable and uses
@@ -3907,7 +4053,14 @@ def run_excel_translation(
                 client=client,
             )
         on_progress(1.0)
-        return text_done_bytes, n_cells, 0, report_rows
+        _, candidate_stats = _merge_term_candidate_contexts(
+            customer_id or "",
+            candidate_contexts,
+            glossary,
+            source_type="Excel",
+        )
+        review_summary = _build_translation_review_summary(0, candidate_stats)
+        return text_done_bytes, n_cells, 0, report_rows, review_summary
 
     with zipfile.ZipFile(io.BytesIO(text_done_bytes)) as zf:
         n_images = sum(
@@ -3917,7 +4070,14 @@ def run_excel_translation(
 
     if n_images == 0:
         on_progress(1.0)
-        return text_done_bytes, n_cells, 0, report_rows
+        _, candidate_stats = _merge_term_candidate_contexts(
+            customer_id or "",
+            candidate_contexts,
+            glossary,
+            source_type="Excel",
+        )
+        review_summary = _build_translation_review_summary(0, candidate_stats)
+        return text_done_bytes, n_cells, 0, report_rows, review_summary
 
     def on_image(idx, total, fname):
         on_cell(f"图片 {idx}/{total}：{fname}")
@@ -3935,7 +4095,14 @@ def run_excel_translation(
             client=client,
         )
     on_progress(1.0)
-    return final_bytes, n_cells, n_images, report_rows
+    _, candidate_stats = _merge_term_candidate_contexts(
+        customer_id or "",
+        candidate_contexts,
+        glossary,
+        source_type="Excel",
+    )
+    review_summary = _build_translation_review_summary(0, candidate_stats)
+    return final_bytes, n_cells, n_images, report_rows, review_summary
 
 
 # ── Excel image translation ───────────────────────────────────────────────────
@@ -4963,7 +5130,7 @@ with tab_excel:
                     scope_cfg = excel_scope_configs.get(ef.name, {})
                     selected_sheets = None if excel_scope_choice == "all" else scope_cfg.get("selected_sheets")
                     scope_detection = scope_cfg.get("detection") if excel_scope_choice != "all" else []
-                    excel_out, n_cells, n_images, report_rows = run_excel_translation(
+                    excel_out, n_cells, n_images, report_rows, review_summary = run_excel_translation(
                         xlsx_bytes=ef.getvalue(),
                         glossary_bytes=glossary_bytes,
                         api_key=api_key,
@@ -5001,6 +5168,7 @@ with tab_excel:
                         "report": report_rows,
                         "img_report": img_report_rows,
                         "n_cells": n_cells,
+                        "review_summary": review_summary,
                     })
                 except Exception as e:
                     cell_ph.empty()
@@ -5040,6 +5208,9 @@ with tab_excel:
             with st.expander(f"{'✅' if r['ok'] else '❌'} {r['name']}", expanded=not r["ok"]):
                 if r["ok"]:
                     base = r["name"].rsplit(".", 1)[0]
+                    review_summary = r.get("review_summary") or {}
+                    if review_summary.get("summary_text"):
+                        st.info(review_summary["summary_text"])
                     report_rows = r["report"]
                     img_report_rows = r.get("img_report") or []
                     n_warn = sum(1 for row in report_rows if row["layout_warning"])
