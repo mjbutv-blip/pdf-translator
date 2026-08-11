@@ -1085,10 +1085,23 @@ _RE_COLOR_CODE_NAME = re.compile(
     r"^(?:pantone\s*)?(?:\d{1,2}\s+\d{3,4}|\d{4,6})(?:\s+[A-Za-z][A-Za-z&'’.\-]*){1,4}$",
     re.IGNORECASE,
 )
+_RE_COLOR_CONTEXT = re.compile(
+    r"(?:color|colour|pantone|pms|swatch|shade|colorway|colourway|颜色|色号|色卡|色样|色板|色名)",
+    re.IGNORECASE,
+)
 _COLOR_HINT_WORDS = {
     "color", "colour", "pantone", "swatch", "shade", "colourway", "colour way",
     "colour ways", "colourways", "pms", "colorway", "colorways", "palette",
     "色号", "色卡", "色样", "颜色", "色板",
+}
+_COMMON_COLOR_WORDS = {
+    "black", "white", "red", "blue", "green", "yellow", "orange", "pink",
+    "purple", "brown", "grey", "gray", "beige", "ivory", "navy", "rose",
+    "burgundy", "maroon", "wine", "teal", "turquoise", "emerald", "violet",
+    "lavender", "lilac", "magenta", "fuchsia", "coral", "mint", "plum",
+    "khaki", "olive", "camel", "sand", "nude", "gold", "silver", "bronze",
+    "copper", "charcoal", "slate", "sapphire", "aqua", "cream", "chocolate",
+    "coffee", "denim", "mustard", "ochre", "apricot", "ruby", "crimson",
 }
 _NON_WORKMANSHIP_TERM_WORDS = {
     "designer", "design", "designed", "designs", "fashion", "trend", "trends",
@@ -1138,9 +1151,12 @@ def _is_color_item(text: str) -> bool:
     if not t:
         return False
     tl = t.lower()
-    if any(hint in tl for hint in _COLOR_HINT_WORDS):
+    if _RE_COLOR_CONTEXT.search(t):
         return True
     if _RE_COLOR_CODE_NAME.match(t):
+        return True
+    tokens = [tok.lower() for tok in re.findall(r"[A-Za-z]+", t)]
+    if len(tokens) <= 4 and any(tok in _COMMON_COLOR_WORDS for tok in tokens):
         return True
     if re.search(r"\bpantone\b", tl) and re.search(r"[A-Za-z]", t):
         return True
@@ -2890,6 +2906,10 @@ def translate_batch(client: anthropic.Anthropic, texts: list[str], glossary: dic
     unique_texts = list(dict.fromkeys(t for t in texts if t.strip()))
     if not unique_texts:
         return {}, set()
+    passthrough = {t: t for t in unique_texts if _is_color_item(t)}
+    unique_texts = [t for t in unique_texts if t not in passthrough]
+    if not unique_texts:
+        return passthrough, set()
 
     rel = relevant_glossary("\n".join(unique_texts), glossary)
     gloss_block = ""
@@ -2955,6 +2975,7 @@ def translate_batch(client: anthropic.Anthropic, texts: list[str], glossary: dic
             mapping[orig] = trans
 
     unrecorded = {t.strip() for t in data.get("unrecorded_terms", []) if t.strip()}
+    mapping.update(passthrough)
     return mapping, unrecorded
 
 
@@ -3055,6 +3076,8 @@ def _force_translate(client: anthropic.Anthropic, text: str, glossary: dict) -> 
     """Last-resort plain-text retry when translate_batch() returns an
     untranslated/empty/identical entry — used instead of silently keeping
     the English original."""
+    if _is_color_item(text):
+        return text
     rel = relevant_glossary(text, glossary)
     gloss_block = ""
     if rel:
@@ -3935,6 +3958,8 @@ def _is_translatable(val) -> bool:
 
 
 def translate_cell_text(client: anthropic.Anthropic, text: str, glossary: dict) -> str:
+    if _is_color_item(text):
+        return text
     rel = relevant_glossary(text, glossary)
     gloss_block = ""
     if rel:
