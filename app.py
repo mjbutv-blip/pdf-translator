@@ -144,7 +144,7 @@ def _create_anthropic_message(client: OpenAI, **kwargs):
     requested_model = kwargs.pop("model", OPENAI_MODEL)
     timeout = kwargs.pop("timeout", OPENAI_TIMEOUT_SECONDS)
     max_output_tokens = kwargs.pop("max_tokens", kwargs.pop("max_output_tokens", None))
-    temperature = kwargs.pop("temperature", None)
+    kwargs.pop("temperature", None)
     system = kwargs.pop("system", "")
     messages = kwargs.pop("messages", None)
     text_config = kwargs.pop("text", None)
@@ -157,8 +157,6 @@ def _create_anthropic_message(client: OpenAI, **kwargs):
     }
     if max_output_tokens is not None:
         create_kwargs["max_output_tokens"] = max_output_tokens
-    if temperature is not None:
-        create_kwargs["temperature"] = temperature
     if text_config is not None:
         create_kwargs["text"] = text_config
     if reasoning is not None:
