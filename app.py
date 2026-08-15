@@ -3494,16 +3494,16 @@ def run_pdf_translation(
             try:
                 mapping, unrecorded_batch = translate_batch_resilient(client, texts, glossary)
                 for term in unrecorded_batch:
-                    if not _is_workmanship_candidate_term(term, sp["clean_text"]):
-                        continue
-                    all_unrecorded.add(term)
-                    context = next(
+                    context_source = next(
                         (t for t in texts if normalize_term(term) in normalize_term(t)),
                         texts[0] if texts else "",
                     )
+                    if not _is_workmanship_candidate_term(term, context_source):
+                        continue
+                    all_unrecorded.add(term)
                     candidate_contexts.append({
                         "term": term,
-                        "context": context,
+                        "context": context_source,
                         "page_or_sheet": f"第 {pn + 1} 页",
                         "cell_coordinate": "",
                         "source_type": "PDF",
