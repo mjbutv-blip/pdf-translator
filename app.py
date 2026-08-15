@@ -1078,7 +1078,10 @@ _AMBIGUOUS_DIRECTION_WORDS = {
 _BRAND_LIKE_TERMS = {"cotton juice", "cotton juice baby", "uneco", "marca"}
 _RE_DATE_LIKE = re.compile(r"^(?:\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?|\d{4}[./-]\d{1,2}[./-]\d{1,2})$")
 _RE_STYLE_LIKE = re.compile(r"^[A-Z]{1,4}\d{3,}[A-Z0-9\-/ ]*$")
-_RE_PANTONE_LIKE = re.compile(r"^(?:pantone\s*)?\d{2,4}\s*[A-Z]?$", re.IGNORECASE)
+_RE_PANTONE_LIKE = re.compile(
+    r"^(?:pantone\s*)?(?:\d{2}-\d{4}|\d{2}\s+\d{4}|\d{4,6})(?:\s*(?:tcx|tpx|tc|tp|c|u|cp|up))?$",
+    re.IGNORECASE,
+)
 _RE_FILE_PATH_LIKE = re.compile(r"(^/|[A-Za-z]:\\|[/\\][^/\\]+\.(?:pdf|xlsx?)$|\.(?:pdf|xlsx?)$)", re.IGNORECASE)
 _RE_TERM_TOKEN = re.compile(r"[A-Za-z][A-Za-z&'’.\-]*")
 _RE_COLOR_CODE_NAME = re.compile(
@@ -1161,6 +1164,32 @@ def _is_color_item(text: str) -> bool:
     if re.search(r"\bpantone\b", tl) and re.search(r"[A-Za-z]", t):
         return True
     return False
+
+
+def _is_color_chart_item(item: dict) -> bool:
+    en = re.sub(r"\s+", " ", str(item.get("en", "")).strip())
+    zh = re.sub(r"\s+", " ", str(item.get("zh", "")).strip())
+    combined = " ".join(part for part in [en, zh] if part).strip()
+    if not combined:
+        return False
+    if _is_color_item(en) or _is_color_item(zh):
+        return True
+    if _RE_PANTONE_LIKE.match(en) or _RE_PANTONE_LIKE.match(zh):
+        return True
+    if re.search(r"\b(tcx|tpx|tc|tp)\b", combined, re.IGNORECASE) and re.search(r"\d", combined):
+        return True
+    if len(re.findall(r"[A-Za-z]+", en)) <= 4 and len(re.findall(r"[一-鿿]", zh)) >= 2:
+        # OCR sometimes returns only the code in `en` and the translated color name in `zh`.
+        if re.search(r"色|彩|紅|红|蓝|綠|绿|黑|白|灰|紫|棕|金|银|銀|橙|粉|青|褐|葡萄|酒|木", zh):
+            return True
+    return False
+
+
+def _should_skip_color_image_items(items: list[dict]) -> bool:
+    if len(items) < 2:
+        return False
+    color_like = sum(1 for item in items if _is_color_chart_item(item))
+    return color_like >= 2 and (color_like / len(items)) >= 0.6
 
 
 def _is_workmanship_candidate_term(term: str, context: str = "") -> bool:
@@ -4281,7 +4310,7 @@ def _translate_image_bytes(
 ) -> bytes:
     """Send one image to OpenAI Vision, overlay Chinese translations, return new bytes."""
     items = _vision_extract_items(client, img_bytes, ext, glossary)
-    if not items:
+    if not items or _should_skip_color_image_items(items):
         return img_bytes
 
     # Overlay Chinese text with PIL
@@ -4650,6 +4679,16 @@ def add_translated_textboxes_to_excel(
             if not items:
                 report_rows.append({"drawing": dp, "image": fname, "status": "no_text",
                                      "original_text": "", "translated_text": "", "skip_reason": ""})
+                continue
+            if _should_skip_color_image_items(items):
+                report_rows.append({
+                    "drawing": dp,
+                    "image": fname,
+                    "status": "skipped",
+                    "original_text": "",
+                    "translated_text": "",
+                    "skip_reason": "颜色/色号图，按规则跳过",
+                })
                 continue
 
             from_col, from_colOff, from_row, from_rowOff = _anchor_from(anchor_el)
