@@ -1082,20 +1082,24 @@ _RE_PANTONE_LIKE = re.compile(
     r"^(?:pantone\s*)?(?:\d{2}-\d{4}|\d{2}\s+\d{4}|\d{4,6})(?:\s*(?:tcx|tpx|tc|tp|c|u|cp|up))?$",
     re.IGNORECASE,
 )
+_RE_COLOR_CODE_FRAGMENT = re.compile(
+    r"\b(?:pantone|pms)?\s*(?:\d{1,2}[-\s]\d{3,4}|\d{4,6})\s*(?:tcx|tpx|tc|tp|c|u|cp|up)?\b",
+    re.IGNORECASE,
+)
 _RE_FILE_PATH_LIKE = re.compile(r"(^/|[A-Za-z]:\\|[/\\][^/\\]+\.(?:pdf|xlsx?)$|\.(?:pdf|xlsx?)$)", re.IGNORECASE)
 _RE_TERM_TOKEN = re.compile(r"[A-Za-z][A-Za-z&'’.\-]*")
 _RE_COLOR_CODE_NAME = re.compile(
-    r"^(?:pantone\s*)?(?:\d{1,2}\s+\d{3,4}|\d{4,6})(?:\s+[A-Za-z][A-Za-z&'’.\-]*){1,4}$",
+    r"^(?:pantone\s*)?(?:\d{1,2}[-\s]\d{3,4}|\d{4,6})(?:\s*(?:tcx|tpx|tc|tp|c|u|cp|up))?(?:\s+[A-Za-z][A-Za-z&'’.\-]*){0,4}$",
     re.IGNORECASE,
 )
 _RE_COLOR_CONTEXT = re.compile(
-    r"(?:color|colour|pantone|pms|swatch|shade|colorway|colourway|颜色|色号|色卡|色样|色板|色名)",
+    r"(?:color|colour|pantone|pms|swatch|shade|tone|colorway|colourway|颜色|色号|色卡|色样|色板|色名|色调)",
     re.IGNORECASE,
 )
 _COLOR_HINT_WORDS = {
-    "color", "colour", "pantone", "swatch", "shade", "colourway", "colour way",
+    "color", "colour", "pantone", "swatch", "shade", "tone", "colourway", "colour way",
     "colour ways", "colourways", "pms", "colorway", "colorways", "palette",
-    "色号", "色卡", "色样", "颜色", "色板",
+    "色号", "色卡", "色样", "颜色", "色板", "色调",
 }
 _COMMON_COLOR_WORDS = {
     "black", "white", "red", "blue", "green", "yellow", "orange", "pink",
@@ -1156,6 +1160,8 @@ def _is_color_item(text: str) -> bool:
     tl = t.lower()
     if _RE_COLOR_CONTEXT.search(t):
         return True
+    if _RE_PANTONE_LIKE.match(t) or _RE_COLOR_CODE_FRAGMENT.search(t):
+        return True
     if _RE_COLOR_CODE_NAME.match(t):
         return True
     tokens = [tok.lower() for tok in re.findall(r"[A-Za-z]+", t)]
@@ -1166,13 +1172,34 @@ def _is_color_item(text: str) -> bool:
     return False
 
 
+def _should_preserve_color_text(en: str, zh: str = "") -> bool:
+    combined = " ".join(
+        part for part in [
+            re.sub(r"\s+", " ", str(en or "").strip()),
+            re.sub(r"\s+", " ", str(zh or "").strip()),
+        ]
+        if part
+    )
+    if not combined:
+        return False
+    if _is_color_item(en) or _is_color_item(zh) or _is_color_item(combined):
+        return True
+    if re.search(r"\b(?:tcx|tpx|tc|tp|pantone|pms)\b", combined, re.IGNORECASE) and re.search(r"\d", combined):
+        return True
+    if re.search(r"色|彩|紅|红|蓝|綠|绿|黑|白|灰|紫|棕|金|银|銀|橙|粉|青|褐|葡萄|酒|木", str(zh or "")):
+        en_tokens = re.findall(r"[A-Za-z]+", str(en or ""))
+        if len(en_tokens) <= 4 or _RE_COLOR_CODE_FRAGMENT.search(str(en or "")):
+            return True
+    return False
+
+
 def _is_color_chart_item(item: dict) -> bool:
     en = re.sub(r"\s+", " ", str(item.get("en", "")).strip())
     zh = re.sub(r"\s+", " ", str(item.get("zh", "")).strip())
     combined = " ".join(part for part in [en, zh] if part).strip()
     if not combined:
         return False
-    if _is_color_item(en) or _is_color_item(zh):
+    if _should_preserve_color_text(en, zh):
         return True
     if _RE_PANTONE_LIKE.match(en) or _RE_PANTONE_LIKE.match(zh):
         return True
@@ -2917,6 +2944,59 @@ _PDF_METADATA_PATTERNS = [
     re.compile(r"^©\s*NKD Group\b", re.IGNORECASE),
     re.compile(r"\btechnical specification\b", re.IGNORECASE),
 ]
+_HEADER_METADATA_LABELS = {
+    "style info",
+    "style no",
+    "style number",
+    "style",
+    "product group",
+    "product manager",
+    "designer",
+    "member of qa",
+    "qa",
+    "department",
+    "division",
+    "season",
+    "collection",
+    "supplier",
+    "owner",
+    "date",
+    "page",
+    "description",
+    "short model text",
+}
+_TOP_METADATA_FRACTION = 0.28
+
+
+def _metadata_label_key(text: str) -> str:
+    t = str(text or "").strip().lower()
+    t = re.sub(r"[:：]+$", "", t).strip()
+    t = re.sub(r"[-_/]+", " ", t)
+    t = re.sub(r"[^a-z0-9]+", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _looks_like_top_metadata_value(text: str) -> bool:
+    t = re.sub(r"\s+", " ", str(text or "").strip())
+    if not t or len(t) > 32:
+        return False
+    if re.search(r"[一-鿿]", t):
+        return False
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", t)
+    if not words or len(words) > 3:
+        return False
+    lowered = {w.lower() for w in words}
+    if lowered & _WORKMANSHIP_SIGNAL_WORDS:
+        return False
+    if re.search(r"\b(?:bra|brief|hipster|bikini|swim|wire|cup|lace|mesh|aop|crochet|push)\b", t, re.IGNORECASE):
+        return False
+    if re.fullmatch(r"[A-Z]{1,4}", t):
+        return True
+    if re.search(r"[À-ÖØ-öø-ÿ]", t):
+        return True
+    if re.fullmatch(r"(?:[A-Z]\.\s*)?[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}", t):
+        return True
+    return False
 
 
 def _is_pdf_metadata_text(text: str) -> bool:
@@ -2927,6 +3007,28 @@ def _is_pdf_metadata_text(text: str) -> bool:
     if not t:
         return False
     return any(pattern.search(t) for pattern in _PDF_METADATA_PATTERNS)
+
+
+def _is_header_or_metadata_text(
+    text: str,
+    bbox=None,
+    page_height: float | None = None,
+) -> bool:
+    t = re.sub(r"\s+", " ", str(text or "").strip())
+    if not t:
+        return False
+    key = _metadata_label_key(t)
+    if key in _HEADER_METADATA_LABELS:
+        return True
+    if page_height and bbox is not None:
+        try:
+            y0 = float(bbox[1])
+        except (TypeError, ValueError, IndexError):
+            y0 = page_height
+        in_top_info_area = y0 <= page_height * _TOP_METADATA_FRACTION
+        if in_top_info_area and _looks_like_top_metadata_value(t):
+            return True
+    return False
 
 
 def translate_batch(client: anthropic.Anthropic, texts: list[str], glossary: dict) -> tuple[dict[str, str], set[str]]:
@@ -3507,6 +3609,9 @@ def run_pdf_translation(
             # 页眉/页脚/创建日期/款号等 PDF 元数据不是正文，保持原样
             if _is_pdf_metadata_text(_t):
                 done += 1; on_progress(done / total_spans); continue
+            # 顶部样式信息/人员信息/字段名保持原文，不参与翻译
+            if _is_header_or_metadata_text(_t, bbox=sp["bbox"], page_height=page.rect.height):
+                done += 1; on_progress(done / total_spans); continue
             # 真正的尺码代号（S/M/L/XL/XXL...）——保持原样，不翻译
             if _is_pure_size_code(_t):
                 done += 1; on_progress(done / total_spans); continue
@@ -3986,6 +4091,17 @@ def _is_translatable(val) -> bool:
     return bool(re.search(r"[a-zA-Z]", s))
 
 
+def _is_excel_header_or_metadata_cell(ws, cell) -> bool:
+    text = str(cell.value or "").strip()
+    if not text:
+        return False
+    if _is_header_or_metadata_text(text):
+        return True
+    if cell.row <= 10 and _looks_like_top_metadata_value(text):
+        return True
+    return False
+
+
 def translate_cell_text(client: anthropic.Anthropic, text: str, glossary: dict) -> str:
     if _is_color_item(text):
         return text
@@ -4077,14 +4193,18 @@ def run_excel_translation(
         if selected_sheet_set is not None and ws.title not in selected_sheet_set
     ]
 
-    to_translate = [
-        (ws.title, ws, cell)
-        for ws in wb.worksheets
-        if selected_sheet_set is None or ws.title in selected_sheet_set
-        for row in ws.iter_rows()
-        for cell in row
-        if _is_translatable(cell.value) and not _is_color_item(str(cell.value))
-    ]
+    to_translate = []
+    for ws in wb.worksheets:
+        if selected_sheet_set is not None and ws.title not in selected_sheet_set:
+            continue
+        for row in ws.iter_rows():
+            for cell in row:
+                if not _is_translatable(cell.value):
+                    continue
+                text = str(cell.value)
+                if _is_color_item(text) or _is_excel_header_or_metadata_cell(ws, cell):
+                    continue
+                to_translate.append((ws.title, ws, cell))
     n_cells = len(to_translate)
     total_steps = max(n_cells, 1)
     report_rows: list[dict] = []
@@ -4282,6 +4402,8 @@ def _vision_extract_items(
                     {"type": "text", "text": (
                         f"这是一张服装工艺/规格图，图中有英文标注。{gloss_hint}\n\n"
                         "请识别图中全部英文文字，翻译成中文，并给出每处文字在图片中的大致坐标。\n"
+                        "颜色、色号、Pantone/PMS/TCX/TPX/TC/TP、色卡、色样、shade/tone/color/colour 相关文字不要翻译，"
+                        "zh 请返回空字符串。\n"
                         "坐标规则：左上角为(0,0)，右下角为(1,1)，用0~1之间的小数表示。\n"
                         "同时估计该处文字的字号（像素大小）。\n\n"
                         "只返回JSON，格式：\n"
@@ -4323,7 +4445,7 @@ def _translate_image_bytes(
     for item in items:
         zh = str(item.get("zh", "")).strip()
         en = str(item.get("en", "")).strip()
-        if not zh or _is_color_item(en):
+        if not zh or _should_preserve_color_text(en, zh):
             continue
         x = int(float(item.get("x", 0.5)) * iw)
         y = int(float(item.get("y", 0.5)) * ih)
@@ -4710,7 +4832,16 @@ def add_translated_textboxes_to_excel(
             for item in items:
                 zh = str(item.get("zh", "")).strip()
                 en = str(item.get("en", "")).strip()
-                if not zh or _is_color_item(en):
+                if not zh or _should_preserve_color_text(en, zh):
+                    if _should_preserve_color_text(en, zh):
+                        report_rows.append({
+                            "drawing": dp,
+                            "image": fname,
+                            "status": "skipped",
+                            "original_text": en,
+                            "translated_text": zh,
+                            "skip_reason": "颜色/色号文字，按规则保留原文",
+                        })
                     continue
                 x_norm = max(0.0, min(float(item.get("x", 0.5)), 0.95))
                 y_norm = max(0.0, min(float(item.get("y", 0.5)), 0.95))
