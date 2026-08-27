@@ -4083,6 +4083,9 @@ def render_pdf_jobs_panel(current_user: dict, api_key: str) -> None:
 
     st.divider()
     st.subheader("PDF 后台任务")
+    cancel_notice = st.session_state.pop("pdf_cancel_notice", "")
+    if cancel_notice:
+        st.info(cancel_notice)
     refresh_col, cancel_col = st.columns(2)
     with refresh_col:
         if st.button("刷新任务状态", use_container_width=True, key="refresh_pdf_jobs_btn"):
@@ -4091,9 +4094,9 @@ def render_pdf_jobs_panel(current_user: dict, api_key: str) -> None:
         if st.button("取消等待/翻译中的 PDF", use_container_width=True, key="cancel_running_pdf_jobs_btn"):
             cancel_result = cancel_pdf_translation_jobs(current_user["username"])
             if cancel_result["cancelled_count"]:
-                st.success(f"已取消 {cancel_result['cancelled_count']} 个 PDF 任务。")
+                st.session_state["pdf_cancel_notice"] = f"已取消 {cancel_result['cancelled_count']} 个 PDF 任务。可以重新上传文件开始翻译。"
             else:
-                st.info("当前没有等待中或翻译中的 PDF 任务。")
+                st.session_state["pdf_cancel_notice"] = "当前没有等待中或翻译中的 PDF 任务。"
             st.rerun(scope="fragment")
     for job in pdf_jobs:
         label = {
@@ -4108,7 +4111,7 @@ def render_pdf_jobs_panel(current_user: dict, api_key: str) -> None:
                 st.error(job["error"])
             if job.get("error") == PDF_JOB_CANCELLED_ERROR:
                 st.info("该任务已取消。可以重新上传文件开始翻译。")
-            if job["status"] == "failed":
+            if job["status"] == "failed" and job.get("error") != PDF_JOB_CANCELLED_ERROR:
                 delete_translation_job(job["job_id"], current_user["username"])
             if job["status"] == "running":
                 st.caption("如果进度长时间不动，可以重新启动这个后台任务。")
@@ -5033,9 +5036,9 @@ with tab_pdf:
         st.session_state.pop("pdf_batch_results", None)
         st.session_state["pdf_upload_reset_nonce"] += 1
         if cancel_result["cancelled_count"]:
-            st.success(f"已取消 {cancel_result['cancelled_count']} 个 PDF 任务，可以重新上传。")
+            st.session_state["pdf_cancel_notice"] = f"已取消 {cancel_result['cancelled_count']} 个 PDF 任务。可以重新上传文件开始翻译。"
         else:
-            st.info("当前没有等待中或翻译中的 PDF 任务，已重置上传区域。")
+            st.session_state["pdf_cancel_notice"] = "当前没有等待中或翻译中的 PDF 任务，已重置上传区域。"
         st.rerun()
 
     pdf_upload_nonce = st.session_state["pdf_upload_reset_nonce"]
