@@ -3720,6 +3720,7 @@ def run_pdf_translation(
 
 
 _RUNNING_JOB_THREADS: dict[str, threading.Thread] = {}
+PDF_JOB_CANCELLED_ERROR = "USER_CANCELLED"
 
 
 def create_translation_job(
@@ -3769,6 +3770,62 @@ def update_translation_job(job_id: str, **fields) -> None:
             f"UPDATE translation_jobs SET {assignments} WHERE job_id = ?",
             values,
         )
+
+
+def is_translation_job_cancelled(job_id: str) -> bool:
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT status, error FROM translation_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+    return bool(row and row["status"] == "failed" and row["error"] == PDF_JOB_CANCELLED_ERROR)
+
+
+def raise_if_translation_job_cancelled(job_id: str) -> None:
+    if is_translation_job_cancelled(job_id):
+        raise RuntimeError(PDF_JOB_CANCELLED_ERROR)
+
+
+def cancel_pdf_translation_jobs(username: str) -> dict:
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT job_id, status
+            FROM translation_jobs
+            WHERE username = ? AND job_type = 'PDF' AND status IN ('queued', 'running')
+            """,
+            (username,),
+        ).fetchall()
+        job_ids = [row["job_id"] for row in rows]
+        if job_ids:
+            placeholders = ",".join("?" for _ in job_ids)
+            conn.execute(
+                f"""
+                UPDATE translation_jobs
+                SET status = 'failed',
+                    progress = 0,
+                    message = '用户已取消，可重新上传文件开始翻译',
+                    error = ?,
+                    updated_at = ?
+                WHERE job_id IN ({placeholders})
+                """,
+                [PDF_JOB_CANCELLED_ERROR, _now_iso(), *job_ids],
+            )
+    inactive_threads = [
+        job_id for job_id, thread in _RUNNING_JOB_THREADS.items()
+        if not thread.is_alive()
+    ]
+    for job_id in inactive_threads:
+        _RUNNING_JOB_THREADS.pop(job_id, None)
+    return {
+        "cancelled_count": len(job_ids),
+        "queued_count": sum(1 for row in rows if row["status"] == "queued"),
+        "running_count": sum(1 for row in rows if row["status"] == "running"),
+        "running_threads": [
+            job_id for job_id in job_ids
+            if job_id in _RUNNING_JOB_THREADS and _RUNNING_JOB_THREADS[job_id].is_alive()
+        ],
+    }
 
 
 def list_translation_jobs(username: str, job_type: str = "PDF", limit: int = 20) -> list[dict]:
@@ -3858,6 +3915,7 @@ def _run_pdf_translation_job(job_id: str, api_key: str, start_next_on_finish: bo
             row = conn.execute("SELECT * FROM translation_jobs WHERE job_id = ?", (job_id,)).fetchone()
         if row is None:
             return
+        raise_if_translation_job_cancelled(job_id)
         job = dict(row)
         config = json.loads(job.get("config") or "{}")
         update_translation_job(job_id, status="running", progress=0.01, message="正在准备翻译")
@@ -3878,15 +3936,18 @@ def _run_pdf_translation_job(job_id: str, api_key: str, start_next_on_finish: bo
             )
 
             def on_page(pn, total, n_blocks):
+                raise_if_translation_job_cancelled(job_id)
                 update_translation_job(
                     job_id,
                     message=f"第 {pn + 1}/{total} 页，{n_blocks} 个文本块",
                 )
 
             def on_block(preview):
+                raise_if_translation_job_cancelled(job_id)
                 update_translation_job(job_id, message=str(preview)[:180])
 
             def on_progress(frac):
+                raise_if_translation_job_cancelled(job_id)
                 progress = max(0.0, min(float(frac), 1.0))
                 now = time.monotonic()
                 if (
@@ -3917,6 +3978,7 @@ def _run_pdf_translation_job(job_id: str, api_key: str, start_next_on_finish: bo
                 scope_mode=scope_mode,
                 scope_detection=scope_detection,
             )
+            raise_if_translation_job_cancelled(job_id)
             scope_report = _pdf_scope_report_rows(
                 job["source_file_name"],
                 scope_cfg,
@@ -3959,15 +4021,24 @@ def _run_pdf_translation_job(job_id: str, api_key: str, start_next_on_finish: bo
                 ),
             )
     except Exception as exc:
-        update_translation_job(
-            job_id,
-            status="failed",
-            error=str(exc),
-            message="翻译失败",
-        )
+        if str(exc) == PDF_JOB_CANCELLED_ERROR:
+            update_translation_job(
+                job_id,
+                status="failed",
+                progress=0,
+                error=PDF_JOB_CANCELLED_ERROR,
+                message="用户已取消，可重新上传文件开始翻译",
+            )
+        else:
+            update_translation_job(
+                job_id,
+                status="failed",
+                error=str(exc),
+                message="翻译失败",
+            )
     finally:
         _RUNNING_JOB_THREADS.pop(job_id, None)
-        if start_next_on_finish and job:
+        if start_next_on_finish and job and not is_translation_job_cancelled(job_id):
             next_job = get_next_queued_pdf_job(job["username"], exclude_job_id=job_id)
             if next_job:
                 start_pdf_translation_job(
@@ -3994,7 +4065,10 @@ def start_pdf_translation_job(job_id: str, api_key: str, start_next_on_finish: b
 def render_pdf_jobs_panel(current_user: dict, api_key: str) -> None:
     pdf_jobs = list_translation_jobs(current_user["username"], "PDF") if current_user else []
     if pdf_jobs and api_key:
-        has_active_pdf_thread = any(thread.is_alive() for thread in _RUNNING_JOB_THREADS.values())
+        has_active_pdf_thread = any(
+            thread.is_alive() and not is_translation_job_cancelled(job_id)
+            for job_id, thread in _RUNNING_JOB_THREADS.items()
+        )
         has_running_pdf_job = any(job["status"] == "running" for job in pdf_jobs)
         queued_pdf_job = next((job for job in reversed(pdf_jobs) if job["status"] == "queued"), None)
         if queued_pdf_job and not has_active_pdf_thread and not has_running_pdf_job:
@@ -4009,8 +4083,18 @@ def render_pdf_jobs_panel(current_user: dict, api_key: str) -> None:
 
     st.divider()
     st.subheader("PDF 后台任务")
-    if st.button("刷新任务状态", use_container_width=True, key="refresh_pdf_jobs_btn"):
-        st.rerun(scope="fragment")
+    refresh_col, cancel_col = st.columns(2)
+    with refresh_col:
+        if st.button("刷新任务状态", use_container_width=True, key="refresh_pdf_jobs_btn"):
+            st.rerun(scope="fragment")
+    with cancel_col:
+        if st.button("取消等待/翻译中的 PDF", use_container_width=True, key="cancel_running_pdf_jobs_btn"):
+            cancel_result = cancel_pdf_translation_jobs(current_user["username"])
+            if cancel_result["cancelled_count"]:
+                st.success(f"已取消 {cancel_result['cancelled_count']} 个 PDF 任务。")
+            else:
+                st.info("当前没有等待中或翻译中的 PDF 任务。")
+            st.rerun(scope="fragment")
     for job in pdf_jobs:
         label = {
             "queued": "等待中",
@@ -4020,8 +4104,10 @@ def render_pdf_jobs_panel(current_user: dict, api_key: str) -> None:
         }.get(job["status"], job["status"])
         with st.expander(f"{label} · {job['source_file_name']} · {job['updated_at']}", expanded=job["status"] in {"running", "failed"}):
             st.progress(float(job.get("progress") or 0), text=job.get("message") or label)
-            if job.get("error"):
+            if job.get("error") and job.get("error") != PDF_JOB_CANCELLED_ERROR:
                 st.error(job["error"])
+            if job.get("error") == PDF_JOB_CANCELLED_ERROR:
+                st.info("该任务已取消。可以重新上传文件开始翻译。")
             if job["status"] == "failed":
                 delete_translation_job(job["job_id"], current_user["username"])
             if job["status"] == "running":
@@ -4935,18 +5021,36 @@ tab_customer_admin = tabs[6] if len(tabs) > 6 else None
 #  PDF Tab — batch upload, independent processing per file
 # ════════════════════════════════════════════════════════════════════════════
 with tab_pdf:
+    if "pdf_upload_reset_nonce" not in st.session_state:
+        st.session_state["pdf_upload_reset_nonce"] = 0
+    if st.button(
+        "取消当前 PDF 翻译并重新上传",
+        use_container_width=True,
+        key="cancel_reset_pdf_jobs_btn",
+    ):
+        cancel_result = cancel_pdf_translation_jobs(current_user["username"])
+        st.session_state.pop("last_pdf_job_ids", None)
+        st.session_state.pop("pdf_batch_results", None)
+        st.session_state["pdf_upload_reset_nonce"] += 1
+        if cancel_result["cancelled_count"]:
+            st.success(f"已取消 {cancel_result['cancelled_count']} 个 PDF 任务，可以重新上传。")
+        else:
+            st.info("当前没有等待中或翻译中的 PDF 任务，已重置上传区域。")
+        st.rerun()
+
+    pdf_upload_nonce = st.session_state["pdf_upload_reset_nonce"]
     pdf_files = st.file_uploader(
         "上传待翻译 PDF（可一次选择多个文件）",
         type=["pdf"],
         accept_multiple_files=True,
-        key="pdf_uploader",
+        key=f"pdf_uploader_{pdf_upload_nonce}",
     )
     font_label = (
         f"🔤 上传中文字体 TTF（可选，已检测到默认字体 {DEFAULT_FONT.name}）"
         if DEFAULT_FONT.exists()
         else "🔤 上传中文字体 TTF（必填，未检测到默认字体）"
     )
-    font_file = st.file_uploader(font_label, type=["ttf"], key="pdf_font_uploader")
+    font_file = st.file_uploader(font_label, type=["ttf"], key=f"pdf_font_uploader_{pdf_upload_nonce}")
     font_ready = bool(font_file or DEFAULT_FONT.exists())
     selected_glossary_count = len(get_customer_glossary_df(selected_customer_id)) if selected_customer_id else 0
     st.caption(f"📚 当前客户术语库：**{selected_customer_id or '未选择'}** · {selected_glossary_count} 条 active 术语")
@@ -5286,11 +5390,24 @@ def render_customer_glossary_import_panel(
 
 
 with tab_excel:
+    if "excel_upload_reset_nonce" not in st.session_state:
+        st.session_state["excel_upload_reset_nonce"] = 0
+    if st.button(
+        "清空 Excel 翻译并重新上传",
+        use_container_width=True,
+        key="reset_excel_translation_btn",
+    ):
+        st.session_state.pop("excel_batch_results", None)
+        st.session_state["excel_upload_reset_nonce"] += 1
+        st.info("Excel 上传区域已重置，可以重新上传。")
+        st.rerun()
+
+    excel_upload_nonce = st.session_state["excel_upload_reset_nonce"]
     excel_files = st.file_uploader(
         "上传待翻译 Excel（可一次选择多个文件）",
         type=["xlsx"],
         accept_multiple_files=True,
-        key="excel_uploader",
+        key=f"excel_uploader_{excel_upload_nonce}",
     )
     selected_glossary_count = len(get_customer_glossary_df(selected_customer_id)) if selected_customer_id else 0
     st.caption(f"📚 当前客户术语库：**{selected_customer_id or '未选择'}** · {selected_glossary_count} 条 active 术语")
