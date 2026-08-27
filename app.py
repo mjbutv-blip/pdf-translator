@@ -3778,7 +3778,7 @@ def is_translation_job_cancelled(job_id: str) -> bool:
             "SELECT status, error FROM translation_jobs WHERE job_id = ?",
             (job_id,),
         ).fetchone()
-    return bool(row and row["status"] == "failed" and row["error"] == PDF_JOB_CANCELLED_ERROR)
+    return bool(row is None or (row["status"] == "failed" and row["error"] == PDF_JOB_CANCELLED_ERROR))
 
 
 def raise_if_translation_job_cancelled(job_id: str) -> None:
@@ -3801,15 +3801,10 @@ def cancel_pdf_translation_jobs(username: str) -> dict:
             placeholders = ",".join("?" for _ in job_ids)
             conn.execute(
                 f"""
-                UPDATE translation_jobs
-                SET status = 'failed',
-                    progress = 0,
-                    message = '用户已取消，可重新上传文件开始翻译',
-                    error = ?,
-                    updated_at = ?
+                DELETE FROM translation_jobs
                 WHERE job_id IN ({placeholders})
                 """,
-                [PDF_JOB_CANCELLED_ERROR, _now_iso(), *job_ids],
+                job_ids,
             )
     inactive_threads = [
         job_id for job_id, thread in _RUNNING_JOB_THREADS.items()
@@ -4064,6 +4059,9 @@ def start_pdf_translation_job(job_id: str, api_key: str, start_next_on_finish: b
 @st.fragment(run_every=8)
 def render_pdf_jobs_panel(current_user: dict, api_key: str) -> None:
     pdf_jobs = list_translation_jobs(current_user["username"], "PDF") if current_user else []
+    cancel_notice = st.session_state.pop("pdf_cancel_notice", "")
+    if cancel_notice:
+        st.info(cancel_notice)
     if pdf_jobs and api_key:
         has_active_pdf_thread = any(
             thread.is_alive() and not is_translation_job_cancelled(job_id)
@@ -4083,9 +4081,6 @@ def render_pdf_jobs_panel(current_user: dict, api_key: str) -> None:
 
     st.divider()
     st.subheader("PDF 后台任务")
-    cancel_notice = st.session_state.pop("pdf_cancel_notice", "")
-    if cancel_notice:
-        st.info(cancel_notice)
     refresh_col, cancel_col = st.columns(2)
     with refresh_col:
         if st.button("刷新任务状态", use_container_width=True, key="refresh_pdf_jobs_btn"):
