@@ -36,6 +36,7 @@ _prime_streamlit_secrets_env()
 
 from config import DEFAULT_FONT, DEFAULT_GLOSSARY, _use_postgres
 from db_backup import create_sqlite_snapshot, snapshot_download_names, snapshot_metadata_bytes
+from db_diagnostics import database_diagnostics_verdict, get_safe_database_diagnostics
 from translation_core import *
 from translation_core import _load_default_glossary_df
 from translation_jobs import *
@@ -1393,6 +1394,46 @@ if tab_user_admin is not None:
 if tab_database_backup is not None:
     with tab_database_backup:
         st.caption("仅 company_admin 可见。")
+        try:
+            diagnostics = get_safe_database_diagnostics(current_user)
+            verdict = database_diagnostics_verdict(diagnostics)
+            db_cols = st.columns(4)
+            with db_cols[0]:
+                st.metric("数据库", diagnostics.get("database_backend") or "unknown")
+            with db_cols[1]:
+                st.metric("Host", diagnostics.get("host") or "local")
+            with db_cols[2]:
+                st.metric("Database", diagnostics.get("database_name") or "unknown")
+            with db_cols[3]:
+                st.metric("Live Worker", diagnostics.get("worker_health", {}).get("live_worker_count", 0))
+            st.caption(f"数据库时间 UTC：{diagnostics.get('database_time_utc') or 'unknown'}")
+            if diagnostics.get("server_version"):
+                st.caption(f"PostgreSQL：{diagnostics['server_version']}")
+            st.write(f"诊断结论：**{verdict}**")
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {"table": table, "row_count": count}
+                        for table, count in (diagnostics.get("row_counts") or {}).items()
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+            with st.expander("Schema readiness / business distributions", expanded=False):
+                st.json({
+                    "schema_readiness": diagnostics.get("schema_readiness"),
+                    "candidate_count_by_status": diagnostics.get("candidate_count_by_status"),
+                    "translation_job_distribution": diagnostics.get("translation_job_distribution"),
+                    "active_glossary_by_customer": diagnostics.get("active_glossary_by_customer"),
+                    "compare_to_local_old_dry_run": diagnostics.get("compare_to_local_old_dry_run"),
+                })
+            if diagnostics.get("database_backend") == "PostgreSQL" and diagnostics.get("worker_health", {}).get("live_worker_count", 0) == 0:
+                st.warning("production database is reachable, but no external translation worker is currently alive")
+        except Exception as exc:
+            st.error(f"数据库诊断读取失败：{exc}")
+
+        st.divider()
         if _use_postgres():
             st.info("当前数据库已使用 PostgreSQL。无需导出 SQLite 快照。")
         else:
