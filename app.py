@@ -133,6 +133,31 @@ def render_customer_selector(user: dict) -> str | None:
 
 # ── Glossary helpers ───────────────────────────────────────────────────────────
 
+def render_worker_health_indicator() -> None:
+    health = get_worker_queue_health()
+    live_workers = int(health.get("live_worker_count") or 0)
+    queued = int(health.get("queued_count") or 0)
+    running = int(health.get("running_count") or 0)
+    queue_parts = (
+        f"等待任务：{queued}（PDF {health.get('queued_pdf_count', 0)} / Excel {health.get('queued_excel_count', 0)}）"
+        f"｜正在翻译：{running}（PDF {health.get('running_pdf_count', 0)} / Excel {health.get('running_excel_count', 0)}）"
+    )
+    if live_workers <= 0 and queued > 0:
+        st.warning(
+            "后台翻译服务暂未检测到。当前有等待中的翻译任务，这些任务暂时不会开始翻译，"
+            "直到后台翻译服务启动。"
+        )
+        st.caption(queue_parts)
+        return
+    if live_workers <= 0:
+        st.info("后台翻译服务暂未检测到。新任务可以提交，但会保持等待状态，直到后台翻译服务启动。")
+        return
+    if queued or running:
+        st.success(f"后台翻译服务运行中（{live_workers} 个 worker）。{queue_parts}")
+    else:
+        st.success(f"后台翻译服务运行正常（{live_workers} 个 worker）。")
+
+
 @st.fragment(run_every=8)
 def render_pdf_jobs_panel(current_user: dict, api_key: str) -> None:
     pdf_jobs = list_translation_jobs(current_user["username"], "PDF") if current_user else []
@@ -150,6 +175,8 @@ def render_pdf_jobs_panel(current_user: dict, api_key: str) -> None:
                 start_next_on_finish=True,
             )
             st.rerun(scope="fragment")
+    if os.getenv("PDF_WORKER_MODE", "external").strip().lower() != "embedded":
+        render_worker_health_indicator()
     if not pdf_jobs:
         return
 
@@ -678,6 +705,7 @@ def render_customer_glossary_import_panel(
 @st.fragment(run_every=8)
 def render_excel_jobs_panel(current_user: dict) -> None:
     excel_jobs = list_translation_jobs(current_user["username"], "Excel") if current_user else []
+    render_worker_health_indicator()
     if not excel_jobs:
         return
 

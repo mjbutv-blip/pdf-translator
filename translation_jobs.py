@@ -19,6 +19,7 @@ from config import (
     PDF_JOB_HEARTBEAT_SECONDS,
     PDF_JOB_MAX_ATTEMPTS,
     PDF_JOB_STALE_SECONDS,
+    WORKER_STALE_SECONDS,
 )
 from db import get_db_connection
 from translation_core import (
@@ -329,6 +330,158 @@ def get_translation_job_by_id(job_id: str) -> dict | None:
     with get_db_connection() as conn:
         row = conn.execute("SELECT * FROM translation_jobs WHERE job_id = ?", (job_id,)).fetchone()
     return _row_to_dict(row)
+
+
+def register_translation_worker(worker_id: str) -> None:
+    now = _now_iso()
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO translation_workers (
+                worker_id, started_at, heartbeat_at, status, stopped_at
+            )
+            VALUES (?, ?, ?, 'running', NULL)
+            ON CONFLICT(worker_id) DO UPDATE SET
+                started_at = excluded.started_at,
+                heartbeat_at = excluded.heartbeat_at,
+                status = 'running',
+                stopped_at = NULL
+            """,
+            (worker_id, now, now),
+        )
+
+
+def heartbeat_translation_worker(worker_id: str) -> bool:
+    now = _now_iso()
+    with get_db_connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE translation_workers
+            SET heartbeat_at = ?,
+                status = 'running',
+                stopped_at = NULL
+            WHERE worker_id = ?
+            """,
+            (now, worker_id),
+        )
+    return bool(getattr(cur, "rowcount", 0) == 1)
+
+
+def stop_translation_worker(worker_id: str) -> None:
+    now = _now_iso()
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            UPDATE translation_workers
+            SET heartbeat_at = ?,
+                status = 'stopped',
+                stopped_at = ?
+            WHERE worker_id = ?
+            """,
+            (now, now, worker_id),
+        )
+
+
+def list_live_workers(*, now: datetime | None = None) -> list[dict]:
+    health = get_worker_health(now=now, include_workers=True)
+    return [row for row in health.get("workers", []) if row.get("is_live")]
+
+
+def get_worker_health(*, now: datetime | None = None, include_workers: bool = False) -> dict:
+    now_dt = now or datetime.now()
+    stale_before = now_dt - timedelta(seconds=WORKER_STALE_SECONDS)
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT worker_id, started_at, heartbeat_at, status, stopped_at
+            FROM translation_workers
+            ORDER BY heartbeat_at DESC, started_at DESC
+            """
+        ).fetchall()
+    live_count = 0
+    stale_count = 0
+    latest_heartbeat_at = None
+    worker_rows: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        heartbeat_dt = _parse_iso(item.get("heartbeat_at"))
+        is_running = item.get("status") == "running"
+        is_live = bool(is_running and heartbeat_dt and heartbeat_dt >= stale_before)
+        is_stale = bool(is_running and (not heartbeat_dt or heartbeat_dt < stale_before))
+        if is_live:
+            live_count += 1
+        if is_stale:
+            stale_count += 1
+        if heartbeat_dt and (latest_heartbeat_at is None or heartbeat_dt > latest_heartbeat_at):
+            latest_heartbeat_at = heartbeat_dt
+        item["is_live"] = is_live
+        item["is_stale"] = is_stale
+        worker_rows.append(item)
+    result = {
+        "live_worker_count": live_count,
+        "stale_worker_count": stale_count,
+        "latest_heartbeat_at": latest_heartbeat_at.isoformat() if latest_heartbeat_at else None,
+        "worker_stale_seconds": WORKER_STALE_SECONDS,
+    }
+    if include_workers:
+        result["workers"] = worker_rows
+    return result
+
+
+def get_translation_queue_health(*, now: datetime | None = None) -> dict:
+    now_dt = now or datetime.now()
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT job_type, status, MIN(created_at) AS oldest_created_at, COUNT(*) AS n
+            FROM translation_jobs
+            WHERE execution_mode = 'external'
+              AND status IN ('queued', 'running')
+              AND job_type IN ('PDF', 'Excel')
+            GROUP BY job_type, status
+            """
+        ).fetchall()
+    summary = {
+        "queued_count": 0,
+        "running_count": 0,
+        "queued_pdf_count": 0,
+        "queued_excel_count": 0,
+        "running_pdf_count": 0,
+        "running_excel_count": 0,
+        "oldest_queued_created_at": None,
+        "oldest_queue_age_seconds": None,
+    }
+    oldest_dt = None
+    for row in rows:
+        job_type = row["job_type"]
+        status = row["status"]
+        count = int(row["n"] or 0)
+        if status == "queued":
+            summary["queued_count"] += count
+            key = "queued_pdf_count" if job_type == "PDF" else "queued_excel_count"
+            summary[key] += count
+            candidate_oldest = _parse_iso(row["oldest_created_at"])
+            if candidate_oldest and (oldest_dt is None or candidate_oldest < oldest_dt):
+                oldest_dt = candidate_oldest
+        elif status == "running":
+            summary["running_count"] += count
+            key = "running_pdf_count" if job_type == "PDF" else "running_excel_count"
+            summary[key] += count
+    if oldest_dt:
+        summary["oldest_queued_created_at"] = oldest_dt.isoformat()
+        summary["oldest_queue_age_seconds"] = max(0, int((now_dt - oldest_dt).total_seconds()))
+    return summary
+
+
+def get_worker_queue_health(*, now: datetime | None = None) -> dict:
+    health = get_worker_health(now=now)
+    queue = get_translation_queue_health(now=now)
+    return {
+        **health,
+        **queue,
+        "worker_available": health["live_worker_count"] > 0,
+        "queue_waiting_without_worker": queue["queued_count"] > 0 and health["live_worker_count"] == 0,
+    }
 
 
 def delete_translation_job(job_id: str, username: str) -> None:
@@ -1246,6 +1399,13 @@ __all__ = [
     "list_translation_jobs",
     "get_translation_job",
     "get_translation_job_by_id",
+    "register_translation_worker",
+    "heartbeat_translation_worker",
+    "stop_translation_worker",
+    "list_live_workers",
+    "get_worker_health",
+    "get_translation_queue_health",
+    "get_worker_queue_health",
     "delete_translation_job",
     "list_term_candidates_for_job",
     "list_candidate_occurrences",

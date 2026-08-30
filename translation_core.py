@@ -269,6 +269,14 @@ def _postgres_create_schema(conn: DbConnection) -> None:
             created_at TEXT NOT NULL,
             UNIQUE(translation_job_id, candidate_id)
         );
+
+        CREATE TABLE IF NOT EXISTS translation_workers (
+            worker_id TEXT PRIMARY KEY,
+            started_at TEXT NOT NULL,
+            heartbeat_at TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('running', 'stopped')),
+            stopped_at TEXT
+        );
         """
     )
     for sql in [
@@ -313,6 +321,10 @@ def _postgres_create_schema(conn: DbConnection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_translation_jobs_worker
         ON translation_jobs(worker_id, status)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_translation_workers_health
+        ON translation_workers(status, heartbeat_at)
         """,
     ]:
         conn.execute(sql)
@@ -489,6 +501,14 @@ def init_db() -> None:
                 FOREIGN KEY(candidate_id) REFERENCES term_candidates(candidate_id)
             );
 
+            CREATE TABLE IF NOT EXISTS translation_workers (
+                worker_id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('running', 'stopped')),
+                stopped_at TEXT
+            );
+
             CREATE INDEX IF NOT EXISTS idx_translation_candidate_occurrences_job
             ON translation_candidate_occurrences(translation_job_id);
 
@@ -497,6 +517,9 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_translation_candidate_occurrences_created
             ON translation_candidate_occurrences(created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_translation_workers_health
+            ON translation_workers(status, heartbeat_at);
 
             """
         )
