@@ -60,6 +60,9 @@ SQLITE_LOCK_RETRY_BASE_SECONDS = max(
     0.01,
     _float_secret_or_env("SQLITE_LOCK_RETRY_BASE_SECONDS", 0.05),
 )
+AI_RETRY_ATTEMPTS = max(0, _int_secret_or_env("AI_RETRY_ATTEMPTS", 2))
+AI_RETRY_BASE_SECONDS = max(0.01, _float_secret_or_env("AI_RETRY_BASE_SECONDS", 0.5))
+AI_RETRY_MAX_SECONDS = max(AI_RETRY_BASE_SECONDS, _float_secret_or_env("AI_RETRY_MAX_SECONDS", 4.0))
 
 # Backward-compatible aliases so the rest of the file can be migrated gradually.
 ANTHROPIC_MODEL = OPENAI_MODEL
@@ -84,6 +87,9 @@ __all__ = [
     "SQLITE_BUSY_TIMEOUT_MS",
     "SQLITE_LOCK_RETRY_ATTEMPTS",
     "SQLITE_LOCK_RETRY_BASE_SECONDS",
+    "AI_RETRY_ATTEMPTS",
+    "AI_RETRY_BASE_SECONDS",
+    "AI_RETRY_MAX_SECONDS",
     "ANTHROPIC_MODEL",
     "ANTHROPIC_TIMEOUT_SECONDS",
     "ANTHROPIC_FALLBACK_MODELS",

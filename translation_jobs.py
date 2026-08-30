@@ -4,6 +4,7 @@ import os
 import tempfile
 import threading
 import time
+import traceback
 import zipfile
 from datetime import datetime, timedelta
 from uuid import uuid4
@@ -11,6 +12,7 @@ from uuid import uuid4
 import openpyxl
 from openai import OpenAI
 
+from ai_client import ai_call_context, error_metadata
 from config import (
     DEFAULT_FONT,
     OPENAI_API_KEY,
@@ -72,6 +74,51 @@ def _result_meta_with_error(error: str, message: str = "") -> str:
             "candidate_ids_reliable": False,
         },
         ensure_ascii=False,
+    )
+
+
+def _truncate(value: str, limit: int = 2000) -> str:
+    text = str(value or "")
+    return text if len(text) <= limit else text[:limit] + "...[truncated]"
+
+
+def _structured_failure_meta(exc: Exception, *, step: str, job_type: str) -> str:
+    meta = error_metadata(exc, step=step)
+    meta.update({
+        "error": str(exc),
+        "job_type": job_type,
+        "traceback": _truncate(traceback.format_exc(), 4000),
+        "candidate_ids": [],
+        "candidate_count": 0,
+        "candidate_ids_reliable": False,
+    })
+    return json.dumps(meta, ensure_ascii=False)
+
+
+def _user_error_message(exc: Exception, *, default: str = "翻译失败") -> str:
+    meta = error_metadata(exc)
+    labels = {
+        "AI_TIMEOUT": "AI 请求超时",
+        "AI_RATE_LIMIT": "AI 服务限流，请稍后重试",
+        "AI_NETWORK": "AI 网络连接失败",
+        "AI_SERVER_ERROR": "AI 服务暂时不可用",
+        "AI_INVALID_RESPONSE": "AI 返回内容无法解析",
+        "AI_AUTH": "AI 认证失败，请检查 API Key",
+        "AI_MODEL_UNAVAILABLE": "AI 模型不可用",
+        "AI_INVALID_REQUEST": "AI 请求无效",
+        "AI_CANCELLED": "任务已取消",
+    }
+    label = labels.get(meta.get("error_code"))
+    return f"{default}：{label}" if label else default
+
+
+def _set_job_step(job_id: str, worker_id: str, execution_mode: str, step: str, message: str) -> None:
+    update_translation_job_owned(
+        job_id,
+        worker_id,
+        execution_mode=execution_mode,
+        message=message,
+        result_meta=json.dumps({"current_step": step}, ensure_ascii=False),
     )
 
 
@@ -678,7 +725,9 @@ def run_claimed_pdf_job(
 ) -> str:
     job_id = job["job_id"]
     execution_mode = job.get("execution_mode") or "external"
-    _log_worker_event(worker_id, "job_started", job_id, "running")
+    job_started = time.monotonic()
+    step = {"name": "load_input"}
+    _log_worker_event(worker_id, "job_started", job_id, "running", job_type="PDF", step=step["name"])
     heartbeat_stop, heartbeat_thread = _start_worker_heartbeat(job_id, worker_id, execution_mode)
     try:
         _assert_worker_still_owns(job_id, worker_id, execution_mode)
@@ -695,6 +744,8 @@ def run_claimed_pdf_job(
 
         font_bytes = job.get("aux_bytes")
         with tempfile.TemporaryDirectory() as tmpdir:
+            step["name"] = "load_input"
+            _set_job_step(job_id, worker_id, execution_mode, step["name"], "正在读取 PDF 输入")
             if font_bytes:
                 font_path = os.path.join(tmpdir, "font.ttf")
                 with open(font_path, "wb") as f:
@@ -702,6 +753,8 @@ def run_claimed_pdf_job(
             else:
                 font_path = str(DEFAULT_FONT)
 
+            step["name"] = "load_glossary"
+            _set_job_step(job_id, worker_id, execution_mode, step["name"], "正在加载客户术语库")
             glossary_bytes = get_customer_glossary_bytes_for_translation(
                 {"username": job["username"], "role": "company_admin"},
                 job["customer_id"],
@@ -758,23 +811,33 @@ def run_claimed_pdf_job(
             scope_detection = config.get("scope_detection") or []
             scope_cfg = config.get("scope_cfg") or {}
             scope_mode = config.get("scope_mode") or "all"
-            pdf_out, xlsx_out, n_terms, review_summary = translator(
-                pdf_bytes=job["input_bytes"],
-                glossary_bytes=glossary_bytes,
-                font_path=font_path,
-                api_key=api_key,
-                on_page=on_page,
-                on_block=on_block,
-                on_progress=on_progress,
-                customer_id=job["customer_id"],
-                source_file_name=job["source_file_name"],
-                created_by=job["username"],
-                selected_pages=selected_pages,
-                scope_mode=scope_mode,
-                scope_detection=scope_detection,
-                translation_job_id=job_id,
-            )
+            step["name"] = "translate_text"
+            _set_job_step(job_id, worker_id, execution_mode, step["name"], "正在翻译 PDF 文本")
+            with ai_call_context(
+                job_id=job_id,
+                job_type="PDF",
+                step=step["name"],
+                cancel_check=lambda: is_translation_job_cancelled(job_id),
+            ):
+                pdf_out, xlsx_out, n_terms, review_summary = translator(
+                    pdf_bytes=job["input_bytes"],
+                    glossary_bytes=glossary_bytes,
+                    font_path=font_path,
+                    api_key=api_key,
+                    on_page=on_page,
+                    on_block=on_block,
+                    on_progress=on_progress,
+                    customer_id=job["customer_id"],
+                    source_file_name=job["source_file_name"],
+                    created_by=job["username"],
+                    selected_pages=selected_pages,
+                    scope_mode=scope_mode,
+                    scope_detection=scope_detection,
+                    translation_job_id=job_id,
+                )
             _assert_worker_still_owns(job_id, worker_id, execution_mode)
+            step["name"] = "build_output"
+            _set_job_step(job_id, worker_id, execution_mode, step["name"], "正在生成翻译结果")
             scope_report = _pdf_scope_report_rows(
                 job["source_file_name"],
                 scope_cfg,
@@ -798,6 +861,8 @@ def run_claimed_pdf_job(
             elif scope_report_bytes:
                 report_bytes = scope_report_bytes
                 report_kind = "scope"
+            step["name"] = "finalize"
+            _set_job_step(job_id, worker_id, execution_mode, step["name"], "正在保存翻译结果")
             job_candidate_rows = list_term_candidates_for_job(job_id)
             job_candidate_ids = [int(row["candidate_id"]) for row in job_candidate_rows]
             completed = update_translation_job_owned(
@@ -823,6 +888,7 @@ def run_claimed_pdf_job(
                         "candidate_count": len(job_candidate_ids),
                         "candidate_ids_reliable": True,
                         "review_item_count": int((review_summary or {}).get("n_review_items", 0) or 0),
+                        "duration_ms": int((time.monotonic() - job_started) * 1000),
                     },
                     ensure_ascii=False,
                 ),
@@ -830,7 +896,15 @@ def run_claimed_pdf_job(
             )
             if not completed:
                 raise WorkerOwnershipLost(OWNERSHIP_LOST_ERROR)
-            _log_worker_event(worker_id, "job_completed", job_id, "complete")
+            _log_worker_event(
+                worker_id,
+                "job_completed",
+                job_id,
+                "complete",
+                job_type="PDF",
+                step=step["name"],
+                duration_ms=int((time.monotonic() - job_started) * 1000),
+            )
             return "complete"
     except Exception as exc:
         if str(exc) == PDF_JOB_CANCELLED_ERROR:
@@ -845,10 +919,22 @@ def run_claimed_pdf_job(
             execution_mode=execution_mode,
             status="failed",
             error=str(exc),
-            message="翻译失败",
+            message=_user_error_message(exc),
+            result_meta=_structured_failure_meta(exc, step=step["name"], job_type="PDF"),
             heartbeat_at=_now_iso(),
         )
-        _log_worker_event(worker_id, "job_failed", job_id, "failed" if failed else "", error=str(exc))
+        err_meta = error_metadata(exc, step=step["name"])
+        _log_worker_event(
+            worker_id,
+            "job_failed",
+            job_id,
+            "failed" if failed else "",
+            job_type="PDF",
+            step=step["name"],
+            duration_ms=int((time.monotonic() - job_started) * 1000),
+            error_code=err_meta.get("error_code"),
+            retryable=err_meta.get("retryable"),
+        )
         return "failed"
     finally:
         heartbeat_stop.set()
@@ -865,13 +951,17 @@ def run_claimed_excel_job(
 ) -> str:
     job_id = job["job_id"]
     execution_mode = job.get("execution_mode") or "external"
-    _log_worker_event(worker_id, "job_started", job_id, "running", job_type="Excel")
+    job_started = time.monotonic()
+    step = {"name": "load_input"}
+    _log_worker_event(worker_id, "job_started", job_id, "running", job_type="Excel", step=step["name"])
     heartbeat_stop, heartbeat_thread = _start_worker_heartbeat(job_id, worker_id, execution_mode)
     try:
         _assert_worker_still_owns(job_id, worker_id, execution_mode)
         config = json.loads(job.get("config") or "{}")
         last_progress_write = {"ts": 0.0, "value": 0.0}
 
+        step["name"] = "load_glossary"
+        _set_job_step(job_id, worker_id, execution_mode, step["name"], "正在加载客户术语库")
         glossary_bytes = get_customer_glossary_bytes_for_translation(
             {"username": job["username"], "role": "company_admin"},
             job["customer_id"],
@@ -913,24 +1003,34 @@ def run_claimed_excel_job(
         scope_detection = config.get("scope_detection") or []
         scope_mode = config.get("scope_mode") or "all"
         translate_images = bool(config.get("translate_images"))
-        excel_out, n_cells, _n_images, report_rows, review_summary = translator(
-            xlsx_bytes=job["input_bytes"],
-            glossary_bytes=glossary_bytes,
-            api_key=api_key,
-            on_cell=on_cell,
-            on_progress=on_progress,
-            translate_images=False,
-            customer_id=job["customer_id"],
-            source_file_name=job["source_file_name"],
-            created_by=job["username"],
-            selected_sheets=selected_sheets,
-            scope_mode=scope_mode,
-            scope_detection=scope_detection,
-            translation_job_id=job_id,
-        )
+        step["name"] = "translate_text"
+        _set_job_step(job_id, worker_id, execution_mode, step["name"], "正在翻译 Excel 单元格")
+        with ai_call_context(
+            job_id=job_id,
+            job_type="Excel",
+            step=step["name"],
+            cancel_check=lambda: is_translation_job_cancelled(job_id),
+        ):
+            excel_out, n_cells, _n_images, report_rows, review_summary = translator(
+                xlsx_bytes=job["input_bytes"],
+                glossary_bytes=glossary_bytes,
+                api_key=api_key,
+                on_cell=on_cell,
+                on_progress=on_progress,
+                translate_images=False,
+                customer_id=job["customer_id"],
+                source_file_name=job["source_file_name"],
+                created_by=job["username"],
+                selected_sheets=selected_sheets,
+                scope_mode=scope_mode,
+                scope_detection=scope_detection,
+                translation_job_id=job_id,
+            )
         _assert_worker_still_owns(job_id, worker_id, execution_mode)
         img_report_rows: list[dict] = []
         if translate_images:
+            step["name"] = "translate_images"
+            _set_job_step(job_id, worker_id, execution_mode, step["name"], "正在翻译 Excel 图片文字")
             glossary_dict = load_glossary(glossary_bytes)
             client = OpenAI(api_key=api_key)
 
@@ -947,21 +1047,31 @@ def run_claimed_excel_job(
                 ):
                     raise WorkerOwnershipLost(OWNERSHIP_LOST_ERROR)
 
-            excel_out, img_report_rows = image_translator(
-                excel_out,
-                client,
-                glossary_dict,
-                on_image,
-                selected_sheets=selected_sheets,
-            )
+            with ai_call_context(
+                job_id=job_id,
+                job_type="Excel",
+                step=step["name"],
+                cancel_check=lambda: is_translation_job_cancelled(job_id),
+            ):
+                excel_out, img_report_rows = image_translator(
+                    excel_out,
+                    client,
+                    glossary_dict,
+                    on_image,
+                    selected_sheets=selected_sheets,
+                )
 
         _assert_worker_still_owns(job_id, worker_id, execution_mode)
+        step["name"] = "build_report"
+        _set_job_step(job_id, worker_id, execution_mode, step["name"], "正在生成 Excel 翻译报告")
         report_bytes = _build_excel_report_bytes(report_rows, img_report_rows)
         translated_image_count = sum(1 for row in img_report_rows if row.get("status") == "ok")
         job_candidate_rows = list_term_candidates_for_job(job_id)
         job_candidate_ids = [int(row["candidate_id"]) for row in job_candidate_rows]
         unrecorded_terms = list((review_summary or {}).get("unrecorded_terms") or [])
         unrecorded_term_count = int((review_summary or {}).get("unrecorded_term_count", len(unrecorded_terms)) or 0)
+        step["name"] = "finalize"
+        _set_job_step(job_id, worker_id, execution_mode, step["name"], "正在保存翻译结果")
         completed = update_translation_job_owned(
             job_id,
             worker_id,
@@ -988,6 +1098,7 @@ def run_claimed_excel_job(
                     "candidate_ids_reliable": True,
                     "review_item_count": int((review_summary or {}).get("n_review_items", 0) or 0),
                     "review_summary": review_summary,
+                    "duration_ms": int((time.monotonic() - job_started) * 1000),
                 },
                 ensure_ascii=False,
             ),
@@ -995,7 +1106,15 @@ def run_claimed_excel_job(
         )
         if not completed:
             raise WorkerOwnershipLost(OWNERSHIP_LOST_ERROR)
-        _log_worker_event(worker_id, "job_completed", job_id, "complete", job_type="Excel")
+        _log_worker_event(
+            worker_id,
+            "job_completed",
+            job_id,
+            "complete",
+            job_type="Excel",
+            step=step["name"],
+            duration_ms=int((time.monotonic() - job_started) * 1000),
+        )
         return "complete"
     except Exception as exc:
         if str(exc) == PDF_JOB_CANCELLED_ERROR:
@@ -1010,10 +1129,22 @@ def run_claimed_excel_job(
             execution_mode=execution_mode,
             status="failed",
             error=str(exc),
-            message="翻译失败",
+            message=_user_error_message(exc),
+            result_meta=_structured_failure_meta(exc, step=step["name"], job_type="Excel"),
             heartbeat_at=_now_iso(),
         )
-        _log_worker_event(worker_id, "job_failed", job_id, "failed" if failed else "", job_type="Excel", error=str(exc))
+        err_meta = error_metadata(exc, step=step["name"])
+        _log_worker_event(
+            worker_id,
+            "job_failed",
+            job_id,
+            "failed" if failed else "",
+            job_type="Excel",
+            step=step["name"],
+            duration_ms=int((time.monotonic() - job_started) * 1000),
+            error_code=err_meta.get("error_code"),
+            retryable=err_meta.get("retryable"),
+        )
         return "failed"
     finally:
         heartbeat_stop.set()

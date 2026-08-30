@@ -20,6 +20,7 @@ from openai import OpenAI
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
+from ai_client import AIModelUnavailableError, execute_ai_call
 from config import (
     ANTHROPIC_FALLBACK_MODELS,
     ANTHROPIC_MODEL,
@@ -118,6 +119,7 @@ def _create_anthropic_message(client: OpenAI, **kwargs):
     messages = kwargs.pop("messages", None)
     text_config = kwargs.pop("text", None)
     reasoning = kwargs.pop("reasoning", None)
+    ai_step = kwargs.pop("ai_step", "ai_request")
     models_to_try = list(dict.fromkeys([requested_model, *OPENAI_FALLBACK_MODELS]))
     input_messages = _build_openai_input_messages(system, messages)
     create_kwargs = {
@@ -134,7 +136,13 @@ def _create_anthropic_message(client: OpenAI, **kwargs):
         create_kwargs["reasoning"] = {"effort": OPENAI_REASONING_EFFORT}
     for model in models_to_try:
         try:
-            return client.responses.create(model=model, **create_kwargs)
+            return execute_ai_call(
+                lambda model=model: client.responses.create(model=model, **create_kwargs),
+                step=ai_step,
+                operation="responses.create",
+            )
+        except AIModelUnavailableError:
+            continue
         except Exception as exc:
             if _model_not_found_error(exc):
                 continue

@@ -14,6 +14,7 @@ import fitz
 import rfq_identity
 
 
+from ai_client import error_metadata
 from config import DEFAULT_FONT
 from db import get_db_connection
 from translation_core import *
@@ -200,6 +201,7 @@ def _font_job_payload(font_path: str | None, resolved_font_path: str | None = No
 def _update_job_failed(job_id: str | None, exc: Exception) -> None:
     if not job_id:
         return
+    structured = error_metadata(exc, step="translate_text")
     update_translation_job(
         job_id,
         status="failed",
@@ -209,7 +211,11 @@ def _update_job_failed(job_id: str | None, exc: Exception) -> None:
         result_meta=json.dumps(
             {
                 "error": str(exc),
-                "traceback": traceback.format_exc(),
+                "error_code": structured.get("error_code"),
+                "error_step": structured.get("error_step"),
+                "retryable": structured.get("retryable"),
+                "error_message": structured.get("error_message"),
+                "traceback": traceback.format_exc()[:4000],
                 "candidate_ids": [],
                 "candidate_count": 0,
                 "candidate_ids_reliable": False,

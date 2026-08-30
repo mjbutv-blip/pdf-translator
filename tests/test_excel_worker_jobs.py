@@ -15,6 +15,7 @@ import openpyxl
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import db
+import ai_client
 
 
 def _prepare_temp_db(tmpdir: str):
@@ -352,6 +353,31 @@ def test_image_translation_branch_with_fake_image_translator() -> None:
     assert meta["translated_image_count"] == 1
 
 
+def test_job_error_metadata() -> None:
+    import translation_jobs
+
+    job_id = _make_excel_job("ai-timeout.xlsx")
+    job = translation_jobs.claim_next_external_translation_job("metadata-worker")
+    assert job and job["job_id"] == job_id
+
+    def failing_translator(**_kwargs):
+        raise ai_client.AITimeoutError("AI request timed out", attempt=3)
+
+    assert translation_jobs.run_claimed_excel_job(
+        job,
+        "test-key",
+        "metadata-worker",
+        translator=failing_translator,
+    ) == "failed"
+    row = _row(job_id)
+    assert row["status"] == "failed"
+    meta = json.loads(row["result_meta"])
+    assert meta["error_code"] == "AI_TIMEOUT"
+    assert meta["error_step"] == "translate_text"
+    assert meta["retryable"] is True
+    assert "traceback" in meta
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         _prepare_temp_db(tmp)
@@ -377,6 +403,9 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         _prepare_temp_db(tmp)
         test_image_translation_branch_with_fake_image_translator()
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_temp_db(tmp)
+        test_job_error_metadata()
     print("excel worker job tests passed")
 
 
