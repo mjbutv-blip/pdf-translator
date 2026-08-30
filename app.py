@@ -158,7 +158,7 @@ def render_worker_health_indicator() -> None:
         st.success(f"后台翻译服务运行正常（{live_workers} 个 worker）。")
 
 
-@st.fragment(run_every=8)
+@st.fragment
 def render_pdf_jobs_panel(current_user: dict, api_key: str) -> None:
     pdf_jobs = list_translation_jobs(current_user["username"], "PDF") if current_user else []
     if pdf_jobs and api_key and os.getenv("PDF_WORKER_MODE", "external").strip().lower() == "embedded":
@@ -702,7 +702,7 @@ def render_customer_glossary_import_panel(
         )
 
 
-@st.fragment(run_every=8)
+@st.fragment
 def render_excel_jobs_panel(current_user: dict) -> None:
     excel_jobs = list_translation_jobs(current_user["username"], "Excel") if current_user else []
     render_worker_health_indicator()
