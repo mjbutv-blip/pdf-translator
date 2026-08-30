@@ -35,6 +35,7 @@ def _prime_streamlit_secrets_env() -> None:
 _prime_streamlit_secrets_env()
 
 from config import DEFAULT_FONT, DEFAULT_GLOSSARY, _use_postgres
+from db_backup import create_sqlite_snapshot, snapshot_download_names, snapshot_metadata_bytes
 from translation_core import *
 from translation_core import _load_default_glossary_df
 from translation_jobs import *
@@ -316,11 +317,13 @@ if can_approve_glossary_change(current_user):
     tab_labels.append("✅ 术语审批")
     tab_labels.append("👤 用户管理")
     tab_labels.append("🏢 客户管理")
+    tab_labels.append("🛡️ 数据库备份")
 tabs = st.tabs(tab_labels)
 tab_pdf, tab_excel, tab_glossary, tab_candidates = tabs[:4]
 tab_approval = tabs[4] if len(tabs) > 4 else None
 tab_user_admin = tabs[5] if len(tabs) > 5 else None
 tab_customer_admin = tabs[6] if len(tabs) > 6 else None
+tab_database_backup = tabs[7] if len(tabs) > 7 else None
 
 # ════════════════════════════════════════════════════════════════════════════
 #  PDF Tab — batch upload, independent processing per file
@@ -1385,6 +1388,51 @@ if tab_user_admin is not None:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  Database Snapshot Tab
+# ════════════════════════════════════════════════════════════════════════════
+if tab_database_backup is not None:
+    with tab_database_backup:
+        st.caption("仅 company_admin 可见。")
+        if _use_postgres():
+            st.info("当前数据库已使用 PostgreSQL。无需导出 SQLite 快照。")
+        else:
+            st.write("当前数据库：**SQLite**")
+            st.warning("此数据库快照包含公司业务数据，仅用于数据库迁移和灾难恢复，请勿公开分享。")
+            if st.button("生成数据库快照", type="primary", use_container_width=True, key="create_sqlite_snapshot_btn"):
+                try:
+                    snapshot = create_sqlite_snapshot(current_user)
+                    if snapshot.get("status") == "completed":
+                        metadata = snapshot["metadata"]
+                        db_name, meta_name = snapshot_download_names(metadata.get("created_at"))
+                        st.success("数据库快照已生成并验证。")
+                        st.json(metadata)
+                        dl_db, dl_meta = st.columns(2)
+                        with dl_db:
+                            st.download_button(
+                                "下载 SQLite 快照",
+                                data=snapshot["snapshot_bytes"],
+                                file_name=db_name,
+                                mime="application/octet-stream",
+                                use_container_width=True,
+                                key="download_sqlite_snapshot_db",
+                            )
+                        with dl_meta:
+                            st.download_button(
+                                "下载快照 metadata",
+                                data=snapshot_metadata_bytes(metadata),
+                                file_name=meta_name,
+                                mime="application/json",
+                                use_container_width=True,
+                                key="download_sqlite_snapshot_metadata",
+                            )
+                    else:
+                        st.error("数据库快照生成失败，请检查 validation 结果。")
+                        st.json(snapshot.get("metadata", {}))
+                except Exception as exc:
+                    st.error(str(exc))
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  Customer Admin Tab
 # ════════════════════════════════════════════════════════════════════════════
 if tab_customer_admin is not None:
@@ -1448,7 +1496,6 @@ if tab_customer_admin is not None:
                         st.rerun()
                     except Exception as exc:
                         st.error(str(exc))
-
         with import_customer_tab:
             if not customers:
                 st.info("请先创建客户。")

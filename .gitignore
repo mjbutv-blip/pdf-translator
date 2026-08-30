@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 *.db
+migration_work/
 
 # OS
 .DS_Store
