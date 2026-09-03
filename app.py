@@ -160,13 +160,31 @@ def render_worker_health_indicator() -> None:
         st.success(f"后台翻译服务运行正常（{live_workers} 个 worker）。")
 
 
-def _render_active_job(job: dict) -> None:
+def _render_retry_action(job: dict, username: str, key_prefix: str) -> None:
+    st.caption(
+        "如果任务长时间没有进度变化，可以重新提交翻译。"
+        "当前进行中的 AI 请求可能需要在返回或超时后才会完全停止。"
+    )
+    if st.button("🔄 重新翻译", key=f"{key_prefix}_retry_{job['job_id']}"):
+        try:
+            result = retry_translation_job(job["job_id"], username)
+            if result["created"]:
+                st.success("已停止原任务并创建新的翻译任务。")
+            else:
+                st.info("该任务已经重新提交，无需重复操作。")
+            st.code(result["new_job_id"], language=None)
+        except (PermissionError, ValueError, RuntimeError) as exc:
+            st.warning(str(exc))
+
+
+def _render_active_job(job: dict, username: str, key_prefix: str) -> None:
     st.markdown(f"### 正在翻译：{job['source_file_name']}")
     st.caption(
         f"job_id: {job['job_id']} ｜ {job['job_type']} ｜ "
         f"开始：{job['created_at']} ｜ 最近更新：{job['updated_at']}"
     )
     st.progress(float(job.get("progress") or 0), text=job.get("message") or "翻译中")
+    _render_retry_action(job, username, key_prefix)
 
 
 def _prepared_job_result(job: dict, username: str, key_prefix: str) -> dict | None:
@@ -223,7 +241,7 @@ def render_pdf_jobs_panel(current_user: dict, api_key: str) -> None:
     queued_jobs = [job for job in pdf_jobs if job["status"] == "queued"]
     history_jobs = [job for job in pdf_jobs if job["status"] not in {"running", "queued"}][:history_limit]
     for job in running_jobs:
-        _render_active_job(job)
+        _render_active_job(job, current_user["username"], "pdf")
     if queued_jobs:
         st.markdown("### 等待中的任务")
         for job in queued_jobs:
@@ -243,27 +261,7 @@ def render_pdf_jobs_panel(current_user: dict, api_key: str) -> None:
             if job.get("error") == PDF_JOB_CANCELLED_ERROR:
                 st.info("该任务已取消。可以重新上传文件开始翻译。")
             if job["status"] == "failed":
-                delete_translation_job(job["job_id"], current_user["username"])
-            if job["status"] == "running":
-                if os.getenv("PDF_WORKER_MODE", "external").strip().lower() == "embedded":
-                    st.caption("如果进度长时间不动，可以重新启动这个后台任务。")
-                    if st.button(
-                        "重新启动任务",
-                        use_container_width=True,
-                        key=f"restart_pdf_job_{job['job_id']}",
-                    ):
-                        restarted = start_pdf_translation_job(
-                            job["job_id"],
-                            api_key,
-                            start_next_on_finish=True,
-                        )
-                        if restarted:
-                            st.success("已重新启动任务。")
-                        else:
-                            st.info("任务线程仍在运行，请稍后刷新查看。")
-                        st.rerun(scope="fragment")
-                else:
-                    st.caption("该任务由独立 PDF worker 执行；如长时间无变化，请检查 worker.py 是否运行。")
+                _render_retry_action(job, current_user["username"], "pdf_failed")
             if job["status"] == "complete":
                 full_job = _prepared_job_result(job, current_user["username"], "pdf")
                 if full_job:
@@ -769,7 +767,7 @@ def render_excel_jobs_panel(current_user: dict) -> None:
     history_jobs = [job for job in excel_jobs if job["status"] not in {"running", "queued"}][:history_limit]
     complete_jobs = [job for job in history_jobs if job["status"] == "complete"]
     for job in running_jobs:
-        _render_active_job(job)
+        _render_active_job(job, current_user["username"], "excel")
     if queued_jobs:
         st.markdown("### 等待中的任务")
         for job in queued_jobs:
@@ -821,6 +819,8 @@ def render_excel_jobs_panel(current_user: dict) -> None:
                 st.error(job["error"])
             if job.get("error") == PDF_JOB_CANCELLED_ERROR:
                 st.info("该任务已取消。可以重新上传文件开始翻译。")
+            if job["status"] == "failed":
+                _render_retry_action(job, current_user["username"], "excel_failed")
             if job["status"] == "complete":
                 full_job = _prepared_job_result(job, current_user["username"], "excel")
                 if not full_job:

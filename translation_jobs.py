@@ -34,6 +34,7 @@ from translation_core import (
 )
 
 PDF_JOB_CANCELLED_ERROR = "USER_CANCELLED"
+USER_RETRY_REQUESTED_ERROR = "USER_RETRY_REQUESTED"
 WORKER_LOST_ERROR = "WORKER_LOST"
 MAX_ATTEMPTS_EXCEEDED_ERROR = "MAX_ATTEMPTS_EXCEEDED"
 OWNERSHIP_LOST_ERROR = "WORKER_OWNERSHIP_LOST"
@@ -196,6 +197,81 @@ def create_external_excel_translation_job(
         config=config,
         execution_mode="external",
     )
+
+
+def retry_translation_job(job_id: str, username: str) -> dict:
+    """Atomically stop/mark an old job and clone it as one new external queued job."""
+    new_job_id = str(uuid4())
+    now = _now_iso()
+    with get_db_connection() as conn:
+        if not conn.is_postgres:
+            conn.execute("BEGIN IMMEDIATE")
+        lock_clause = " FOR UPDATE" if conn.is_postgres else ""
+        old = conn.execute(
+            f"""
+            SELECT job_id, job_type, status, username, customer_id, source_file_name,
+                   input_bytes, aux_bytes, config, result_meta
+            FROM translation_jobs
+            WHERE job_id = ? AND username = ?{lock_clause}
+            """,
+            (job_id, username),
+        ).fetchone()
+        if old is None:
+            raise PermissionError("任务不存在或无权重新翻译")
+        if old["status"] == "queued":
+            raise ValueError("等待中的任务不能重复提交")
+        if old["status"] == "complete":
+            raise ValueError("已完成任务不能通过此入口重新翻译")
+        if old["status"] not in {"running", "failed"}:
+            raise ValueError(f"当前任务状态不能重新翻译：{old['status']}")
+
+        old_meta = json.loads(old["result_meta"] or "{}")
+        existing_retry_id = old_meta.get("retry_job_id")
+        if existing_retry_id:
+            return {"new_job_id": existing_retry_id, "created": False}
+
+        old_meta.update({"retry_job_id": new_job_id, "retry_requested_at": now})
+        if old["status"] == "running":
+            cur = conn.execute(
+                """
+                UPDATE translation_jobs
+                SET status = 'failed', message = '用户已重新提交翻译', error = ?,
+                    worker_id = NULL, heartbeat_at = NULL, result_meta = ?, updated_at = ?
+                WHERE job_id = ? AND username = ? AND status = 'running'
+                """,
+                (USER_RETRY_REQUESTED_ERROR, json.dumps(old_meta, ensure_ascii=False), now, job_id, username),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE translation_jobs
+                SET result_meta = ?, updated_at = ?
+                WHERE job_id = ? AND username = ? AND status = 'failed'
+                """,
+                (json.dumps(old_meta, ensure_ascii=False), now, job_id, username),
+            )
+        if getattr(cur, "rowcount", 0) != 1:
+            raise RuntimeError("任务状态已变化，请刷新后重试")
+
+        config = json.loads(old["config"] or "{}")
+        config["retry_of_job_id"] = job_id
+        conn.execute(
+            """
+            INSERT INTO translation_jobs (
+                job_id, job_type, status, username, customer_id, source_file_name,
+                progress, message, input_bytes, aux_bytes, config,
+                execution_mode, worker_id, heartbeat_at, attempt_count, created_at, updated_at
+            )
+            VALUES (?, ?, 'queued', ?, ?, ?, 0, '等待开始', ?, ?, ?,
+                    'external', NULL, NULL, 0, ?, ?)
+            """,
+            (
+                new_job_id, old["job_type"], old["username"], old["customer_id"],
+                old["source_file_name"], old["input_bytes"], old["aux_bytes"],
+                json.dumps(config, ensure_ascii=False), now, now,
+            ),
+        )
+    return {"new_job_id": new_job_id, "created": True}
 
 
 def update_translation_job(job_id: str, **fields) -> None:
@@ -1407,6 +1483,7 @@ def start_pdf_translation_job(job_id: str, api_key: str | None = None, start_nex
 
 __all__ = [
     "PDF_JOB_CANCELLED_ERROR",
+    "USER_RETRY_REQUESTED_ERROR",
     "WORKER_LOST_ERROR",
     "MAX_ATTEMPTS_EXCEEDED_ERROR",
     "OWNERSHIP_LOST_ERROR",
@@ -1414,6 +1491,7 @@ __all__ = [
     "_RUNNING_JOB_THREADS",
     "create_translation_job",
     "create_external_excel_translation_job",
+    "retry_translation_job",
     "update_translation_job",
     "update_translation_job_owned",
     "is_translation_job_cancelled",
