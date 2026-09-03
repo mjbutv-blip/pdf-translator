@@ -160,9 +160,30 @@ def render_worker_health_indicator() -> None:
         st.success(f"后台翻译服务运行正常（{live_workers} 个 worker）。")
 
 
+def _render_active_job(job: dict) -> None:
+    st.markdown(f"### 正在翻译：{job['source_file_name']}")
+    st.caption(
+        f"job_id: {job['job_id']} ｜ {job['job_type']} ｜ "
+        f"开始：{job['created_at']} ｜ 最近更新：{job['updated_at']}"
+    )
+    st.progress(float(job.get("progress") or 0), text=job.get("message") or "翻译中")
+
+
+def _prepared_job_result(job: dict, username: str, key_prefix: str) -> dict | None:
+    state_key = f"prepared_translation_result_{job['job_id']}"
+    prepared = st.session_state.get(state_key)
+    if prepared is None and st.button("准备下载", key=f"{key_prefix}_prepare_{job['job_id']}"):
+        prepared = get_translation_job_result(job["job_id"], username)
+        if prepared:
+            st.session_state[state_key] = prepared
+            st.rerun(scope="fragment")
+    return prepared
+
+
 @st.fragment(run_every=8)
 def render_pdf_jobs_panel(current_user: dict, api_key: str) -> None:
-    pdf_jobs = list_translation_jobs(current_user["username"], "PDF") if current_user else []
+    history_limit = st.session_state.get("pdf_job_history_limit", 10)
+    pdf_jobs = list_translation_jobs(current_user["username"], "PDF", history_limit + 20) if current_user else []
     if pdf_jobs and api_key and os.getenv("PDF_WORKER_MODE", "external").strip().lower() == "embedded":
         has_active_pdf_thread = any(
             thread.is_alive() and not is_translation_job_cancelled(job_id)
@@ -198,7 +219,17 @@ def render_pdf_jobs_panel(current_user: dict, api_key: str) -> None:
             else:
                 st.info("当前没有等待中或翻译中的 PDF 任务。")
             st.rerun(scope="fragment")
-    for job in pdf_jobs:
+    running_jobs = [job for job in pdf_jobs if job["status"] == "running"]
+    queued_jobs = [job for job in pdf_jobs if job["status"] == "queued"]
+    history_jobs = [job for job in pdf_jobs if job["status"] not in {"running", "queued"}][:history_limit]
+    for job in running_jobs:
+        _render_active_job(job)
+    if queued_jobs:
+        st.markdown("### 等待中的任务")
+        for job in queued_jobs:
+            st.caption(f"{job['source_file_name']} ｜ {job['job_id']} ｜ {job['created_at']}")
+    st.markdown("### 最近完成任务")
+    for job in history_jobs:
         label = {
             "queued": "等待中",
             "running": "翻译中",
@@ -234,7 +265,7 @@ def render_pdf_jobs_panel(current_user: dict, api_key: str) -> None:
                 else:
                     st.caption("该任务由独立 PDF worker 执行；如长时间无变化，请检查 worker.py 是否运行。")
             if job["status"] == "complete":
-                full_job = get_translation_job(job["job_id"], current_user["username"])
+                full_job = _prepared_job_result(job, current_user["username"], "pdf")
                 if full_job:
                     meta = json.loads(full_job.get("result_meta") or "{}")
                     base = full_job["source_file_name"].rsplit(".", 1)[0]
@@ -268,6 +299,9 @@ def render_pdf_jobs_panel(current_user: dict, api_key: str) -> None:
                                 use_container_width=True,
                                 key=f"job_pdf_report_dl_{job['job_id']}",
                             )
+    if len(history_jobs) == history_limit and st.button("加载更多历史任务", key="more_pdf_history"):
+        st.session_state["pdf_job_history_limit"] = history_limit + 10
+        st.rerun(scope="fragment")
 
 
 # ── Streamlit page ─────────────────────────────────────────────────────────────
@@ -708,7 +742,8 @@ def render_customer_glossary_import_panel(
 
 @st.fragment(run_every=8)
 def render_excel_jobs_panel(current_user: dict) -> None:
-    excel_jobs = list_translation_jobs(current_user["username"], "Excel") if current_user else []
+    history_limit = st.session_state.get("excel_job_history_limit", 10)
+    excel_jobs = list_translation_jobs(current_user["username"], "Excel", history_limit + 20) if current_user else []
     render_worker_health_indicator()
     if not excel_jobs:
         return
@@ -729,30 +764,48 @@ def render_excel_jobs_panel(current_user: dict) -> None:
                 st.info("当前没有等待中或翻译中的 Excel 任务。")
             st.rerun(scope="fragment")
 
-    complete_jobs = [job for job in excel_jobs if job["status"] == "complete"]
+    running_jobs = [job for job in excel_jobs if job["status"] == "running"]
+    queued_jobs = [job for job in excel_jobs if job["status"] == "queued"]
+    history_jobs = [job for job in excel_jobs if job["status"] not in {"running", "queued"}][:history_limit]
+    complete_jobs = [job for job in history_jobs if job["status"] == "complete"]
+    for job in running_jobs:
+        _render_active_job(job)
+    if queued_jobs:
+        st.markdown("### 等待中的任务")
+        for job in queued_jobs:
+            st.caption(f"{job['source_file_name']} ｜ {job['job_id']} ｜ {job['created_at']}")
+    st.markdown("### 最近完成任务")
+    batch_zip_key = "prepared_excel_jobs_zip"
     if len(complete_jobs) > 1:
-        zip_buf = io.BytesIO()
-        with zipfile.ZipFile(zip_buf, "w") as zf:
-            for job in complete_jobs:
-                full_job = get_translation_job(job["job_id"], current_user["username"])
-                if not full_job:
-                    continue
-                base = full_job["source_file_name"].rsplit(".", 1)[0]
-                if full_job.get("result_file"):
-                    zf.writestr(f"{base}_中文版.xlsx", full_job["result_file"])
-                if full_job.get("result_report"):
-                    zf.writestr(f"{base}_翻译报告.xlsx", full_job["result_report"])
-        st.download_button(
-            label=f"⬇️  打包下载全部 {len(complete_jobs)} 个译文（ZIP）",
-            data=zip_buf.getvalue(),
-            file_name="translated_excels.zip",
-            mime="application/zip",
-            use_container_width=True,
-            type="primary",
-            key="excel_jobs_zip_dl",
-        )
-
-    for job in excel_jobs:
+        if batch_zip_key not in st.session_state and st.button(
+            f"准备批量 ZIP（{len(complete_jobs)} 个译文）",
+            key="prepare_excel_jobs_zip",
+        ):
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w") as zf:
+                for completed_job in complete_jobs:
+                    full_job = get_translation_job_result(completed_job["job_id"], current_user["username"])
+                    if not full_job:
+                        continue
+                    base = full_job["source_file_name"].rsplit(".", 1)[0]
+                    if full_job.get("result_file"):
+                        zf.writestr(f"{base}_中文版.xlsx", full_job["result_file"])
+                    if full_job.get("result_report"):
+                        zf.writestr(f"{base}_翻译报告.xlsx", full_job["result_report"])
+            st.session_state[batch_zip_key] = zip_buf.getvalue()
+            st.rerun(scope="fragment")
+        prepared_zip = st.session_state.get(batch_zip_key)
+        if prepared_zip:
+            st.download_button(
+                label=f"⬇️ 打包下载 {len(complete_jobs)} 个译文（ZIP）",
+                data=prepared_zip,
+                file_name="translated_excels.zip",
+                mime="application/zip",
+                use_container_width=True,
+                type="primary",
+                key="excel_jobs_zip_dl",
+            )
+    for job in history_jobs:
         label = {
             "queued": "等待中",
             "running": "翻译中",
@@ -769,7 +822,7 @@ def render_excel_jobs_panel(current_user: dict) -> None:
             if job.get("error") == PDF_JOB_CANCELLED_ERROR:
                 st.info("该任务已取消。可以重新上传文件开始翻译。")
             if job["status"] == "complete":
-                full_job = get_translation_job(job["job_id"], current_user["username"])
+                full_job = _prepared_job_result(job, current_user["username"], "excel")
                 if not full_job:
                     continue
                 meta = json.loads(full_job.get("result_meta") or "{}")
@@ -800,6 +853,9 @@ def render_excel_jobs_panel(current_user: dict) -> None:
                         use_container_width=True,
                         key=f"excel_report_dl_{job['job_id']}",
                     )
+    if len(history_jobs) == history_limit and st.button("加载更多历史任务", key="more_excel_history"):
+        st.session_state["excel_job_history_limit"] = history_limit + 10
+        st.rerun(scope="fragment")
 
 
 with tab_excel:

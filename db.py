@@ -4,6 +4,8 @@ import random
 import re
 import sqlite3
 import time
+import os
+import threading
 
 from config import (
     DB_PATH,
@@ -43,7 +45,20 @@ class DbConnection:
             url = _database_url()
             if url.startswith("postgres://"):
                 url = "postgresql://" + url[len("postgres://"):]
-            self.conn = psycopg.connect(url, row_factory=dict_row)
+            attempt = 0
+            while True:
+                self._pool_context = _postgres_pool(url, dict_row).connection(
+                    timeout=POSTGRES_POOL_ACQUIRE_TIMEOUT_SECONDS
+                )
+                try:
+                    self.conn = self._pool_context.__enter__()
+                    break
+                except psycopg.OperationalError:
+                    if attempt >= POSTGRES_CONNECT_RETRY_ATTEMPTS:
+                        raise
+                    attempt += 1
+                    print(f"event=postgres_connect_retry attempt={attempt}", flush=True)
+                    time.sleep(POSTGRES_CONNECT_RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
         else:
             self.conn = sqlite3.connect(DB_PATH, timeout=SQLITE_TIMEOUT_SECONDS)
             self.conn.row_factory = sqlite3.Row
@@ -94,10 +109,11 @@ class DbConnection:
         )
 
     def __enter__(self):
-        self.conn.__enter__()
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        if self.is_postgres:
+            return self._pool_context.__exit__(exc_type, exc, tb)
         return self.conn.__exit__(exc_type, exc, tb)
 
     def execute(self, sql: str, params=()):
@@ -132,6 +148,37 @@ class DbConnection:
 
 def get_db_connection() -> DbConnection:
     return DbConnection()
+
+
+POSTGRES_CONNECT_TIMEOUT_SECONDS = int(os.getenv("POSTGRES_CONNECT_TIMEOUT_SECONDS", "5"))
+POSTGRES_CONNECT_RETRY_ATTEMPTS = int(os.getenv("POSTGRES_CONNECT_RETRY_ATTEMPTS", "2"))
+POSTGRES_CONNECT_RETRY_BASE_SECONDS = float(os.getenv("POSTGRES_CONNECT_RETRY_BASE_SECONDS", "0.2"))
+POSTGRES_POOL_MIN_SIZE = int(os.getenv("POSTGRES_POOL_MIN_SIZE", "0"))
+POSTGRES_POOL_MAX_SIZE = int(os.getenv("POSTGRES_POOL_MAX_SIZE", "4"))
+POSTGRES_POOL_ACQUIRE_TIMEOUT_SECONDS = float(os.getenv("POSTGRES_POOL_ACQUIRE_TIMEOUT_SECONDS", "5"))
+_POSTGRES_POOL = None
+_POSTGRES_POOL_KEY = None
+_POSTGRES_POOL_LOCK = threading.Lock()
+
+
+def _postgres_pool(url: str, row_factory):
+    global _POSTGRES_POOL, _POSTGRES_POOL_KEY
+    key = (os.getpid(), url)
+    with _POSTGRES_POOL_LOCK:
+        if _POSTGRES_POOL is None or _POSTGRES_POOL_KEY != key:
+            from psycopg_pool import ConnectionPool
+
+            _POSTGRES_POOL = ConnectionPool(
+                conninfo=url,
+                min_size=max(0, POSTGRES_POOL_MIN_SIZE),
+                max_size=max(1, POSTGRES_POOL_MAX_SIZE),
+                open=True,
+                kwargs={"row_factory": row_factory, "connect_timeout": POSTGRES_CONNECT_TIMEOUT_SECONDS},
+                check=ConnectionPool.check_connection,
+                name=f"pdf-project-{os.getpid()}",
+            )
+            _POSTGRES_POOL_KEY = key
+        return _POSTGRES_POOL
 
 
 __all__ = ["DbConnection", "get_db_connection"]

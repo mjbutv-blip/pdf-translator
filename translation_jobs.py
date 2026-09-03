@@ -300,12 +300,12 @@ def list_translation_jobs(username: str, job_type: str = "PDF", limit: int = 20)
     with get_db_connection() as conn:
         rows = conn.execute(
             """
-            SELECT job_id, job_type, status, username, customer_id, source_file_name,
-                   progress, message, error, result_meta, execution_mode, worker_id, heartbeat_at,
-                   attempt_count, created_at, updated_at
+            SELECT job_id, source_file_name, job_type, status, progress, message, error,
+                   created_at, updated_at, execution_mode, worker_id, heartbeat_at
             FROM translation_jobs
             WHERE username = ? AND job_type = ?
-            ORDER BY created_at DESC
+            ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
+                     created_at DESC
             LIMIT ?
             """,
             (username, job_type, limit),
@@ -320,6 +320,21 @@ def get_translation_job(job_id: str, username: str) -> dict | None:
             SELECT *
             FROM translation_jobs
             WHERE job_id = ? AND username = ?
+            """,
+            (job_id, username),
+        ).fetchone()
+    return _row_to_dict(row)
+
+
+def get_translation_job_result(job_id: str, username: str) -> dict | None:
+    """Load result bytes for exactly one authorized completed job."""
+    with get_db_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT job_id, source_file_name, job_type, status,
+                   result_file, result_report, result_meta
+            FROM translation_jobs
+            WHERE job_id = ? AND username = ? AND status = 'complete'
             """,
             (job_id, username),
         ).fetchone()
@@ -880,7 +895,11 @@ def run_claimed_pdf_job(
     execution_mode = job.get("execution_mode") or "external"
     job_started = time.monotonic()
     step = {"name": "load_input"}
-    _log_worker_event(worker_id, "job_started", job_id, "running", job_type="PDF", step=step["name"])
+    _log_worker_event(
+        worker_id, "job_started", job_id, "running", job_type="PDF", step=step["name"],
+        filename=job.get("source_file_name"), progress=job.get("progress"),
+        attempt_count=job.get("attempt_count"), heartbeat_at=job.get("heartbeat_at"),
+    )
     heartbeat_stop, heartbeat_thread = _start_worker_heartbeat(job_id, worker_id, execution_mode)
     try:
         _assert_worker_still_owns(job_id, worker_id, execution_mode)
@@ -1106,7 +1125,11 @@ def run_claimed_excel_job(
     execution_mode = job.get("execution_mode") or "external"
     job_started = time.monotonic()
     step = {"name": "load_input"}
-    _log_worker_event(worker_id, "job_started", job_id, "running", job_type="Excel", step=step["name"])
+    _log_worker_event(
+        worker_id, "job_started", job_id, "running", job_type="Excel", step=step["name"],
+        filename=job.get("source_file_name"), progress=job.get("progress"),
+        attempt_count=job.get("attempt_count"), heartbeat_at=job.get("heartbeat_at"),
+    )
     heartbeat_stop, heartbeat_thread = _start_worker_heartbeat(job_id, worker_id, execution_mode)
     try:
         _assert_worker_still_owns(job_id, worker_id, execution_mode)
