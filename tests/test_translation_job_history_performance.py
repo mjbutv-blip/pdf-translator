@@ -66,6 +66,12 @@ def test_result_bytes_have_a_dedicated_single_job_query():
     assert "status = 'complete'" in source
 
 
+def test_result_loader_is_available_to_app_star_import():
+    namespace = {}
+    exec("from translation_jobs import *", namespace)
+    assert namespace["get_translation_job_result"] is translation_jobs.get_translation_job_result
+
+
 def test_active_jobs_are_sorted_before_history_in_metadata_query():
     source = inspect.getsource(translation_jobs.list_translation_jobs).lower()
     assert "when 'running' then 0" in source

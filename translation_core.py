@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import io
 import json
 import os
@@ -2437,6 +2438,16 @@ def relevant_glossary(text: str, glossary: dict) -> dict:
     return result
 
 
+def exact_glossary_translation(text: str, glossary: dict) -> str | None:
+    """Return an approved translation only for a literal whole-text match."""
+    source = str(text).strip()
+    translated = glossary.get(source)
+    if translated is None:
+        return None
+    translated = str(translated).strip()
+    return translated or None
+
+
 # ── Glossary management (editable in-session glossary) ─────────────────────────
 
 _GLOSSARY_EN_COL   = "英文术语"
@@ -3606,6 +3617,7 @@ def run_pdf_translation(
     }
     all_unrecorded: set[str] = set()
     candidate_contexts: list[dict] = []
+    translation_cache: dict[str, str] = {}
 
     # 以 span 为最小单元预扫描：bbox 精确到每一段文字，数字 span 绝不擦除
     page_spans: list[list[dict]] = []
@@ -3672,13 +3684,27 @@ def run_pdf_translation(
         results = []
         for batch in _chunk(to_translate, _MAX_BATCH_ITEMS):
             texts = [b["clean_text"] for b in batch]
-            on_block(f"批量翻译 {len(texts)} 项…")
+            pending_texts = list(dict.fromkeys(text for text in texts if text not in translation_cache))
+            api_texts = []
+            for text in pending_texts:
+                exact_translation = exact_glossary_translation(text, glossary)
+                if exact_translation is not None:
+                    translation_cache[text] = exact_translation
+                else:
+                    api_texts.append(text)
+
+            mapping: dict[str, str] = {}
+            if api_texts:
+                on_block(f"批量翻译 {len(api_texts)} 项…")
             try:
-                mapping, unrecorded_batch = translate_batch_resilient(client, texts, glossary)
+                mapping, unrecorded_batch = (
+                    translate_batch_resilient(client, api_texts, glossary)
+                    if api_texts else ({}, set())
+                )
                 for term in unrecorded_batch:
                     context_source = next(
-                        (t for t in texts if normalize_term(term) in normalize_term(t)),
-                        texts[0] if texts else "",
+                        (t for t in api_texts if normalize_term(term) in normalize_term(t)),
+                        api_texts[0] if api_texts else "",
                     )
                     if not _is_workmanship_candidate_term(term, context_source):
                         continue
@@ -3704,7 +3730,7 @@ def run_pdf_translation(
                         "source_type": "PDF",
                         "is_workmanship_source": workmanship_by_page.get(pn + 1, False),
                     })
-                translated = mapping.get(sp["clean_text"], "")
+                translated = translation_cache.get(sp["clean_text"], mapping.get(sp["clean_text"], ""))
                 if _needs_retranslation(sp["clean_text"], translated):
                     try:
                         translated = _force_translate(client, sp["clean_text"], glossary)
@@ -3714,6 +3740,8 @@ def run_pdf_translation(
 
                 if not translated.strip():
                     translated = sp["clean_text"]
+
+                translation_cache[sp["clean_text"]] = translated
 
                 results.append({**sp, "translated": translated})
                 done += 1
@@ -3905,6 +3933,7 @@ def run_excel_translation(
     total_steps = max(n_cells, 1)
     report_rows: list[dict] = []
     candidate_contexts: list[dict] = []
+    translation_cache: dict[str, str] = {}
     detection_by_sheet = {
         row.get("sheet_name"): row
         for row in (scope_detection or [])
@@ -3956,9 +3985,14 @@ def run_excel_translation(
         }
 
         try:
-            translated = translate_cell_text(client, original, glossary)
-            if _needs_retranslation(original, translated):
-                translated = _force_translate(client, original, glossary)
+            translated = translation_cache.get(original)
+            if translated is None:
+                translated = exact_glossary_translation(original, glossary)
+            if translated is None:
+                translated = translate_cell_text(client, original, glossary)
+                if _needs_retranslation(original, translated):
+                    translated = _force_translate(client, original, glossary)
+            translation_cache[original] = translated
             cell.value = translated
             row_report["translated_text"] = translated
 
@@ -4164,10 +4198,14 @@ def translate_images_in_excel(
         if n.startswith("xl/media/") and n.rsplit(".", 1)[-1].lower() in _IMAGE_EXTS
     ]
 
+    translated_by_digest: dict[tuple[str, str], bytes] = {}
     for idx, name in enumerate(media):
         ext = name.rsplit(".", 1)[-1].lower()
         on_image(idx + 1, len(media), name.split("/")[-1])
-        all_data[name] = _translate_image_bytes(client, all_data[name], ext, glossary)
+        cache_key = (ext, hashlib.sha256(all_data[name]).hexdigest())
+        if cache_key not in translated_by_digest:
+            translated_by_digest[cache_key] = _translate_image_bytes(client, all_data[name], ext, glossary)
+        all_data[name] = translated_by_digest[cache_key]
 
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w") as zf_out:

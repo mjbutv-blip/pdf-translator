@@ -1499,6 +1499,7 @@ __all__ = [
     "cancel_pdf_translation_jobs",
     "list_translation_jobs",
     "get_translation_job",
+    "get_translation_job_result",
     "get_translation_job_by_id",
     "register_translation_worker",
     "heartbeat_translation_worker",
