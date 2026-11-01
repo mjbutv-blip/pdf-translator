@@ -2975,7 +2975,7 @@ _GARMENT_SYSTEM_PROMPT = (
 )
 
 
-_MAX_BATCH_ITEMS = max(3, _int_secret_or_env("PDF_TRANSLATION_BATCH_SIZE", 6))
+_MAX_BATCH_ITEMS = max(3, _int_secret_or_env("PDF_TRANSLATION_BATCH_SIZE", 12))
 
 
 def _chunk(items: list, n: int) -> list[list]:
@@ -3022,8 +3022,28 @@ _HEADER_METADATA_LABELS = {
     "page",
     "description",
     "short model text",
+    "measures",
+    "pantone colour",
+    "pantone colours",
+    "pantone color",
+    "pantone colors",
+    "pack created",
+    "marketing name",
+    "style type",
+    "type",
+    "marca",
+    "unece",
+    "quality",
+    "shell fabric",
+    "fabric quality",
+    "fabric colour",
+    "fabric color",
+    "sample quantity",
+    "size range",
 }
 _TOP_METADATA_FRACTION = 0.28
+_TOP_MARGIN_FRACTION = 0.085
+_BOTTOM_MARGIN_FRACTION = 0.93
 
 
 def _metadata_label_key(text: str) -> str:
@@ -3081,12 +3101,128 @@ def _is_header_or_metadata_text(
     if page_height and bbox is not None:
         try:
             y0 = float(bbox[1])
+            y1 = float(bbox[3])
         except (TypeError, ValueError, IndexError):
             y0 = page_height
+            y1 = page_height
+        # Repeated document chrome at the extreme top/bottom is never part of
+        # the workmanship body. This catches file paths, copyright lines and
+        # page footers even when their wording changes between customers.
+        if y1 <= page_height * _TOP_MARGIN_FRACTION or y0 >= page_height * _BOTTOM_MARGIN_FRACTION:
+            return True
         in_top_info_area = y0 <= page_height * _TOP_METADATA_FRACTION
         if in_top_info_area and _looks_like_top_metadata_value(t):
             return True
     return False
+
+
+def _union_pdf_bboxes(items: list[dict]) -> tuple[float, float, float, float]:
+    boxes = [item["bbox"] for item in items]
+    return (
+        min(float(box[0]) for box in boxes),
+        min(float(box[1]) for box in boxes),
+        max(float(box[2]) for box in boxes),
+        max(float(box[3]) for box in boxes),
+    )
+
+
+def _join_pdf_span_texts(spans: list[dict]) -> str:
+    """Rebuild one visual line without losing punctuation or numeric units."""
+    ordered = sorted(spans, key=lambda item: (float(item["bbox"][0]), float(item["bbox"][1])))
+    result = ""
+    previous = None
+    for span in ordered:
+        text = _clean_extracted_text(span.get("text", ""))
+        if not text:
+            continue
+        if not result:
+            result = text
+            previous = span
+            continue
+        gap = float(span["bbox"][0]) - float(previous["bbox"][2]) if previous else 99.0
+        font_size = max(float(span.get("size") or 0), float((previous or {}).get("size") or 0), 1.0)
+        touches = gap <= max(1.0, font_size * 0.12)
+        punctuation_join = result[-1:] in "(/[-" or text[:1] in ",.;:!?%)]}，。；：！？）】"
+        result += ("" if touches or punctuation_join else " ") + text
+        previous = span
+    return re.sub(r"\s+", " ", result).strip()
+
+
+def _split_pdf_line_spans(spans: list[dict]) -> list[list[dict]]:
+    """Keep distant table cells separate while joining fragmented phrases."""
+    ordered = sorted(spans, key=lambda item: (float(item["bbox"][0]), float(item["bbox"][1])))
+    groups: list[list[dict]] = []
+    for span in ordered:
+        if not groups:
+            groups.append([span])
+            continue
+        previous = groups[-1][-1]
+        gap = float(span["bbox"][0]) - float(previous["bbox"][2])
+        font_size = max(float(span.get("size") or 0), float(previous.get("size") or 0), 1.0)
+        if gap > max(30.0, font_size * 4.0):
+            groups.append([span])
+        else:
+            groups[-1].append(span)
+    return groups
+
+
+def _pdf_lines_can_merge(previous: dict, current: dict, group: list[dict]) -> bool:
+    """Join short wrapped lines from the same PDF text block."""
+    if len(group) >= 3:
+        return False
+    prev_box = previous["bbox"]
+    cur_box = current["bbox"]
+    max_size = max(float(previous.get("size") or 0), float(current.get("size") or 0), 1.0)
+    vertical_gap = float(cur_box[1]) - float(prev_box[3])
+    if vertical_gap < -max_size * 0.35 or vertical_gap > max_size * 1.15:
+        return False
+    overlap = max(0.0, min(float(prev_box[2]), float(cur_box[2])) - max(float(prev_box[0]), float(cur_box[0])))
+    min_width = max(1.0, min(float(prev_box[2]) - float(prev_box[0]), float(cur_box[2]) - float(cur_box[0])))
+    aligned = abs(float(prev_box[0]) - float(cur_box[0])) <= max(18.0, max_size * 2.5)
+    if not aligned and overlap / min_width < 0.25:
+        return False
+    combined_length = sum(len(item["text"]) for item in group) + len(current["text"])
+    return combined_length <= 320 and (len(previous["text"]) <= 120 or len(current["text"]) <= 120)
+
+
+def _build_pdf_translation_units(blocks: list[dict]) -> list[dict]:
+    """Convert PDF spans into line-aware translation units.
+
+    Units retain a single bounding box for overlay, but the AI sees adjacent
+    fragments together. Images and empty blocks are ignored.
+    """
+    units: list[dict] = []
+    for block in blocks:
+        if block.get("type") != 0:
+            continue
+        lines: list[dict] = []
+        for line in block.get("lines", []):
+            spans = [span for span in line.get("spans", []) if str(span.get("text") or "").strip()]
+            for span_group in _split_pdf_line_spans(spans):
+                text = _join_pdf_span_texts(span_group)
+                if not text:
+                    continue
+                lines.append({
+                    "bbox": _union_pdf_bboxes(span_group),
+                    "text": text,
+                    "size": min(float(span.get("size") or 8.0) for span in span_group),
+                    "span_count": len(span_group),
+                })
+        index = 0
+        while index < len(lines):
+            group = [lines[index]]
+            index += 1
+            while index < len(lines) and _pdf_lines_can_merge(group[-1], lines[index], group):
+                group.append(lines[index])
+                index += 1
+            units.append({
+                "bbox": _union_pdf_bboxes(group),
+                "text": " ".join(item["text"] for item in group),
+                "size": min(item["size"] for item in group),
+                "span_count": sum(item["span_count"] for item in group),
+                "line_count": len(group),
+            })
+    return units
 
 
 def translate_batch(client: anthropic.Anthropic, texts: list[str], glossary: dict) -> tuple[dict[str, str], set[str]]:
@@ -3619,27 +3755,13 @@ def run_pdf_translation(
     candidate_contexts: list[dict] = []
     translation_cache: dict[str, str] = {}
 
-    # 以 span 为最小单元预扫描：bbox 精确到每一段文字，数字 span 绝不擦除
+    # 先按视觉行/短文本块组合。AI 获得完整上下文，同时仍保留精确 bbox 用于回写。
     page_spans: list[list[dict]] = []
     for pn in range(total_pages):
         if selected_page_set is not None and pn not in selected_page_set:
             page_spans.append([])
             continue
-        ts = []
-        for blk in doc[pn].get_text("dict")["blocks"]:
-            if blk["type"] != 0:
-                continue
-            for ln in blk.get("lines", []):
-                for sp in ln.get("spans", []):
-                    text = sp["text"].strip()
-                    if not text:
-                        continue
-                    ts.append({
-                        "bbox": sp["bbox"],
-                        "text": sp["text"],
-                        "size": sp["size"],
-                    })
-        page_spans.append(ts)
+        page_spans.append(_build_pdf_translation_units(doc[pn].get_text("dict")["blocks"]))
 
     total_spans = max(sum(len(s) for s in page_spans), 1)
     done = 0
